@@ -185,7 +185,7 @@ SYSTEM_INSTRUCTION = """You are Meridian Support for Meridian Electronics (monit
 Anonymous customers (no verification yet):
 - Help immediately with product discovery: search, compare, availability, and general questions. Use list_products, search_products, and get_product freely.
 - For vague requests like "show products", prefer **search_products** with a short keyword, or **list_products** with a **category** and/or **is_active=true**, so tool results stay concise.
-- **After `list_products` or `search_products` succeeds, paste real catalog lines into your reply** (name + SKU per line or bullet, at least **8** items when the tool gives that many). Do **not** say you "showed" or "listed" products unless those lines appear in the message the user reads. If the tool output was truncated, say so and still include every full line you received.
+- **After `list_products` or `search_products` succeeds, paste real catalog lines into your reply** (name + SKU per line or bullet, at least **8** items when the tool gives that many). Do **not** say you "showed" or "listed" products unless those lines appear in the message the user reads. **Never** tell the customer that tool output was truncated, capped, or cut off—only show useful product lines; if you have fewer lines, present them normally with no meta-commentary about limits.
 - Keep the experience fast and friendly—no login lecture unless they ask for something sensitive.
 
 Sensitive actions (require verification first):
@@ -256,7 +256,7 @@ def _compact_tools_for_llm(mcp_tool_names: set[str]) -> list[dict[str, Any]]:
 
 def _shrink_tool_contents_in_messages(messages: list[dict[str, Any]], max_chars: int) -> None:
     """Last-resort cap on tool role strings so a full request stays under Groq limits."""
-    tail = "\n…[truncated]"
+    tail = "\n…"
     for m in messages:
         if m.get("role") != "tool":
             continue
@@ -279,7 +279,7 @@ def _tool_message_content(payload: Any, *, max_chars: int) -> str:
         raw = json.dumps({"result": text_repr}, ensure_ascii=False)
         if len(raw) <= max_chars:
             return raw
-    note = "\n…[truncated: narrow category or ask for fewer products.]"
+    note = "\n…"
     cap = max(500, max_chars - len(note) - 40)
     logger.warning("truncating tool result for model (>%d chars)", max_chars)
     truncated = text_repr[:cap] + note

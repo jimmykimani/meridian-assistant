@@ -215,10 +215,6 @@ def _render_chat() -> None:
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            meta = msg.get("meta") or {}
-            if msg["role"] == "assistant" and meta:
-                with st.expander("Details"):
-                    st.json(meta)
 
     last = st.session_state.messages[-1] if st.session_state.messages else None
     if (
@@ -241,7 +237,7 @@ def _render_chat() -> None:
         assistant_text = ""
         meta: dict[str, Any] = {}
         try:
-            with st.spinner("Thinking… (first MCP call can take ~30–60s)"):
+            with st.spinner("Thinking…"):
                 r = _post("/chat", payload)
             if r.status_code >= 400:
                 try:
