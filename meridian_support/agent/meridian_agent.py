@@ -199,6 +199,10 @@ SYSTEM_INSTRUCTION = """You are Meridian Support for Meridian Electronics (monit
 - When the shopper asks for **“everything”**, **“all products”**, or **20+ items at once**, do **not** paste a giant list: show **up to ~15** strong matches (or one **category** at a time), then invite them to name another category or “show more monitors” etc. Use **list_products** with a `category` filter or **search_products** so tool output stays manageable.
 - When the tool returns many rows, show **at least 8** and up to **15** in one reply unless the user asked for fewer. Never mention internal limits or truncation.
 
+**Catalog tools are ground truth:**
+- Whatever **get_product**, **list_products**, or **search_products** returns for a SKU (name, category, price, stock) is **authoritative**. **Never** contradict it in a later turn (do not relabel a SKU as a different product type than the tool showed). If you listed a SKU for the shopper, they may order **that exact SKU**.
+- If you need to double-check, call **get_product** again with the same SKU instead of guessing.
+
 **Placing an order:**
 - If the shopper wants to check out but is not verified yet, ask them—in chat—for **Meridian email** and **4-digit PIN** on separate lines (or clearly labeled). Say you will not repeat the PIN. Optionally remind them they can also use the sidebar **Account — orders & purchases** form.
 - As soon as they provide both, call **verify_customer_pin** with those values, then continue with create_order / cart help using tools.
@@ -507,9 +511,11 @@ class MeridianAgent:
         system_text = SYSTEM_INSTRUCTION
         if session.authenticated_customer_id:
             system_text += (
-                "\n\n**Already signed in:** This session is verified with Meridian. "
-                "Do **not** ask for email or PIN again, and do **not** claim their credentials were wrong, "
-                "unless an MCP tool just returned a verification error. For orders, confirm SKU/qty and use **create_order**."
+                "\n\n**Already signed in:** This session is verified with Meridian (sidebar or chat). "
+                "Do **not** ask for email or PIN again, do **not** say they must verify before checkout, "
+                "and do **not** claim credentials failed unless an MCP tool just returned a verification error. "
+                "When they confirm a product (e.g. “COM-0045 is fine”, “order this SKU”), call **create_order** "
+                "with that SKU and quantity **without** re-asking for sign-in."
             )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_text},

@@ -11,6 +11,7 @@ import html
 import json
 import os
 import re
+import time
 from typing import Any
 
 import httpx
@@ -36,7 +37,7 @@ def _env_or_secret(key: str, default: str) -> str:
 
 
 API_BASE = _env_or_secret("MERIDIAN_API_URL", DEFAULT_API).rstrip("/")
-CHAT_TIMEOUT = float(_env_or_secret("MERIDIAN_CHAT_TIMEOUT", "180"))
+CHAT_TIMEOUT = float(_env_or_secret("MERIDIAN_CHAT_TIMEOUT", "300"))
 _SHOW_API_URL = _env_or_secret("MERIDIAN_SHOW_API_URL", "false").strip().lower() in (
     "1",
     "true",
@@ -264,13 +265,22 @@ def _sidebar_account_panel() -> None:
             "Verify only when you need **order history**, **order details**, "
             "**account info**, or **placing an order**."
         )
+        go = False
+        em = ""
+        pin = ""
         if authed:
             st.success(f"Verified as **{st.session_state.signed_in_email or 'customer'}**")
-        with st.form("verify_form"):
-            em = st.text_input("Meridian email", placeholder="donaldgarcia@example.net")
-            pin = st.text_input("4-digit PIN", type="password", max_chars=12)
-            go = st.form_submit_button("Verify account")
-        if go:
+            st.caption(
+                "You're signed in for this chat session. Use **Sign out (account only)** below if you need a different account."
+            )
+        else:
+            with st.form("meridian_verify_form", clear_on_submit=False):
+                em = st.text_input(
+                    "Meridian email", placeholder="donaldgarcia@example.net", key="meridian_verify_email"
+                )
+                pin = st.text_input("4-digit PIN", type="password", max_chars=12, key="meridian_verify_pin")
+                go = st.form_submit_button("Verify account")
+        if not authed and go:
             if not em or not pin or len(pin.strip()) < 4:
                 st.error("Enter email and PIN.")
             else:
@@ -279,7 +289,7 @@ def _sidebar_account_panel() -> None:
                     "pin": pin.strip(),
                     "session_id": st.session_state.session_id,
                 }
-                with st.spinner("Checking with Meridian…"):
+                with st.spinner("Verifying account with Meridian…"):
                     try:
                         r = _post_auth_verify(payload)
                     except Exception as exc:
@@ -351,8 +361,22 @@ def _render_chat() -> None:
         assistant_text = ""
         meta: dict[str, Any] = {}
         with st.chat_message("assistant"):
+            cap = st.empty()
             slot = st.empty()
-            slot.caption("Thinking…")
+            t_chat = time.monotonic()
+
+            def _stream_status(elapsed: float, *, has_tokens: bool) -> None:
+                if has_tokens:
+                    cap.caption("Writing reply…")
+                    return
+                if elapsed < 2.0:
+                    cap.caption("Thinking…")
+                elif elapsed < 25.0:
+                    cap.caption(f"Fetching reply… ({elapsed:.0f}s)")
+                else:
+                    cap.caption(f"Still working — catalog or AI can take a bit… ({elapsed:.0f}s)")
+
+            _stream_status(0.0, has_tokens=False)
             try:
                 with httpx.Client(timeout=CHAT_TIMEOUT) as client:
                     with client.stream("POST", f"{API_BASE}/chat/stream", json=payload) as r:
@@ -365,6 +389,7 @@ def _render_chat() -> None:
                                 st.session_state.session_id = None
                                 st.session_state.messages = []
                                 _ensure_session_id()
+                            cap.caption("")
                             slot.markdown(assistant_text)
                         elif r.status_code == 410:
                             raw = r.read()
@@ -379,6 +404,7 @@ def _render_chat() -> None:
                             assistant_text = (
                                 f"{err_body}\n\nA new session was started—sign in again from the sidebar if you need your account."
                             )
+                            cap.caption("")
                             slot.markdown(assistant_text)
                         elif r.status_code >= 400:
                             raw = r.read()
@@ -388,11 +414,13 @@ def _render_chat() -> None:
                                 err_body = raw.decode("utf-8", errors="replace")
                             meta = {"error": err_body, "status_code": r.status_code}
                             assistant_text = str(err_body)
+                            cap.caption("")
                             slot.markdown(assistant_text)
                         else:
                             saw_final = False
                             buf = ""
                             for line in r.iter_lines():
+                                _stream_status(time.monotonic() - t_chat, has_tokens=bool(buf.strip()))
                                 if not line or not str(line).strip():
                                     continue
                                 try:
@@ -400,8 +428,11 @@ def _render_chat() -> None:
                                 except json.JSONDecodeError:
                                     continue
                                 ev_type = ev.get("event")
-                                if ev_type == "delta":
+                                if ev_type == "status":
+                                    continue
+                                elif ev_type == "delta":
                                     buf += str(ev.get("text", ""))
+                                    _stream_status(time.monotonic() - t_chat, has_tokens=True)
                                     slot.markdown(buf + "▌")
                                 elif ev_type == "final":
                                     saw_final = True
@@ -414,6 +445,7 @@ def _render_chat() -> None:
                                     sid = ev.get("session_id")
                                     if sid:
                                         st.session_state.session_id = sid
+                                    cap.caption("")
                                     slot.markdown(assistant_text)
                                 elif ev_type == "error":
                                     meta = {
@@ -421,15 +453,18 @@ def _render_chat() -> None:
                                         "status_code": ev.get("status_code", 502),
                                     }
                                     assistant_text = str(ev.get("detail", buf))
+                                    cap.caption("")
                                     slot.markdown(assistant_text)
                                     saw_final = True
                             if not saw_final and not meta.get("error"):
                                 meta = {"error": "Stream ended without a final event", "status_code": 502}
                                 assistant_text = buf or "No response from the assistant."
+                                cap.caption("")
                                 slot.markdown(assistant_text)
             except Exception as exc:
                 meta = {"error": str(exc)}
                 assistant_text = str(exc)
+                cap.caption("")
                 slot.markdown(assistant_text)
 
         st.session_state.messages.append(
