@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from agent import (
+from meridian_support.agent import (
     SENSITIVE_TOOLS,
     detect_prompt_injection,
     extract_customer_id_from_tool_result,
 )
-from session_manager import SessionManager
+from meridian_support.session_manager import SessionManager
 
 
 def test_detect_prompt_injection() -> None:

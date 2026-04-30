@@ -8,6 +8,8 @@
 
 AI customer support prototype for Meridian Electronics: **Groq** (Llama, tool calling) + **Meridian order MCP** (Streamable HTTP). **FastAPI** exposes `/chat`; **Streamlit** is the demo UI.
 
+**Layout:** Application code lives in **`meridian_support/`** (API, agent, MCP client, Streamlit UI). Repo-root **`main.py`** and **`ui.py`** are thin entrypoints so `uvicorn main:app`, `streamlit run ui.py`, Docker, and Streamlit Cloud keep the same commands.
+
 ## Prerequisites
 
 - Python **3.10+** (3.11+ recommended)
@@ -101,6 +103,14 @@ Step-by-step for **Cloud Run**, **Compose on a VM**, and checklists: **[deploy/D
 - **`/health` works but `/chat` fails** — check **`GROQ_API_KEY`**, model id (`GROQ_MODEL`), or MCP cold start; see uvicorn logs.
 
 ## Tests
+
+Run before you push (same as `make test`):
+
+```bash
+make check
+```
+
+Or directly:
 
 ```bash
 pytest tests/ -m "not integration" -v

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from schema_utils import simplify_schema_for_gemini
+from meridian_support.schema_utils import simplify_schema_for_gemini
 
 
 def test_simplify_anyof_prefers_string_branch() -> None:

@@ -1,4 +1,4 @@
-"""Ensure repo root is on sys.path when tests are run via `pytest` (not `python -m pytest`)."""
+"""Put repo root on sys.path so `meridian_support` and entry shims (`main`, `ui`) import cleanly."""
 
 from __future__ import annotations
 

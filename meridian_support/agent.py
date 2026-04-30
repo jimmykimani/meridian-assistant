@@ -16,9 +16,9 @@ from typing import Any
 
 from openai import APIStatusError, AsyncOpenAI, RateLimitError
 
-from mcp_client import MCPClient
-from session_manager import SessionState
-from settings import Settings
+from meridian_support.mcp_client import MCPClient
+from meridian_support.session_manager import SessionState
+from meridian_support.settings import Settings
 
 logger = logging.getLogger(__name__)
 

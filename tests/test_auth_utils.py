@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from auth_utils import mask_email
+from meridian_support.auth_utils import mask_email
 
 
 def test_mask_email() -> None:

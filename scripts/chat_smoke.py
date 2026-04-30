@@ -13,10 +13,10 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from agent import MeridianAgent  # noqa: E402
-from mcp_client import MCPClient  # noqa: E402
-from session_manager import SessionManager  # noqa: E402
-from settings import Settings  # noqa: E402
+from meridian_support.agent import MeridianAgent  # noqa: E402
+from meridian_support.mcp_client import MCPClient  # noqa: E402
+from meridian_support.session_manager import SessionManager  # noqa: E402
+from meridian_support.settings import Settings  # noqa: E402
 
 
 async def main() -> None:

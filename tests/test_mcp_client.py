@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from mcp_client import (
+from meridian_support.mcp_client import (
     MAX_FAILURES,
     CircuitBreaker,
     MCPClient,

@@ -9,7 +9,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # Load repo-root `.env` even when the process cwd is elsewhere.
-load_dotenv(Path(__file__).resolve().parent / ".env")
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(_REPO_ROOT / ".env")
 
 
 @dataclass(frozen=True)

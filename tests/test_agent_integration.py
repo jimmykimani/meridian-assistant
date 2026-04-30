@@ -4,10 +4,10 @@ import os
 
 import pytest
 
-from agent import MeridianAgent
-from mcp_client import MCPClient
-from session_manager import SessionManager
-from settings import Settings
+from meridian_support.agent import MeridianAgent
+from meridian_support.mcp_client import MCPClient
+from meridian_support.session_manager import SessionManager
+from meridian_support.settings import Settings
 
 
 pytestmark = pytest.mark.skipif(

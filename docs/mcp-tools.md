@@ -121,7 +121,7 @@ Production-oriented async client (httpx): `initialize`, `list_tools` (cached), `
 
 ---
 
-## Phase 3 — Agent (`agent.py`, `session_manager.py`, `settings.py`)
+## Phase 3 — Agent (`meridian_support/agent.py`, `session_manager.py`, `settings.py`)
 
 - **Groq** (Llama via OpenAI-compatible API) with **function calling**; tools built from live **`tools/list`** (via `schema_utils`).
 - **Session** state: serialized chat history (OpenAI-style messages) + authenticated `customer_id` after `verify_customer_pin`.
@@ -133,7 +133,7 @@ Production-oriented async client (httpx): `initialize`, `list_tools` (cached), `
 
 ## Phase 4 — UI + deployment (no Hugging Face)
 
-Implemented: **`main.py`** (FastAPI: `/health`, `/sessions/new`, `/sessions/reset`, `/chat`) and **`ui.py`** (Streamlit). Run locally with **uvicorn** + **streamlit** (see [README.md](../README.md)), or **`docker compose up`**.
+Implemented: **`meridian_support/api.py`** (FastAPI: `/health`, `/sessions/new`, `/sessions/reset`, `/chat`), exposed as **`main:app`** via root `main.py`, and **`meridian_support/streamlit_app.py`** (Streamlit), run via root **`ui.py`**. See [README.md](../README.md) or **`docker compose up`**.
 
 Deploy targets: **GCP Cloud Run**, **VM + Docker**, **local + tunnel** — store `GROQ_API_KEY` in the host’s secret manager, not in git.
 

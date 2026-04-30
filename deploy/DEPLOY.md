@@ -92,12 +92,64 @@ If MCP returns **403** from Cloud Run egress, ask the backend team to **allowlis
 
 ---
 
-## 3) Render / Fly.io (sketch)
+## 3) Render (API + Streamlit — two Web Services)
 
-- **Two web services** from the same repo and Docker image.
-- **API:** start command `uvicorn main:app --host 0.0.0.0 --port 8000`.
-- **UI:** start command `streamlit run ui.py --server.port 8501 --server.address 0.0.0.0` and env `MERIDIAN_API_URL=https://<api-host>`.
-- Add **health check** path `/health` on the API service.
+Render gives **one URL per Web Service**. If you only created **one** service running `uvicorn`, opening that URL shows the API JSON at `/` — **that is expected**. The Streamlit app is a **second** process and needs a **second** Web Service (same Git repo).
+
+### A) API service (you may already have this)
+
+- **Root directory:** repo root (or leave default).
+- **Runtime:** Python, or Docker using this repo’s `Dockerfile` (override start if the image defaults to port 8000 — Render still expects the app to listen on **`$PORT`**).
+- **Build:** `pip install -r requirements.txt`
+- **Start:** `uvicorn main:app --host 0.0.0.0 --port $PORT`  
+  (Render sets **`PORT`**; do not hard-code `8000` unless your dashboard explicitly maps it.)
+- **Health check path:** `/health`
+- **Environment:** set `GROQ_API_KEY` (and optional vars from the README). After the UI exists, set **`CORS_ORIGINS`** to a comma-separated list that includes **your Streamlit service’s public `https://…onrender.com` URL** (and localhost if you still test locally). Example:  
+  `https://meridian-support-ui.onrender.com,http://localhost:8501,http://127.0.0.1:8501`
+
+Without the UI origin in `CORS_ORIGINS`, the browser will block chat requests from the Streamlit tab.
+
+### B) Streamlit UI service (add this to get a real UI URL)
+
+1. **Dashboard → New → Web Service**, same repository.
+2. **Build:** `pip install -r requirements.txt`
+3. **Start command:**
+
+   ```bash
+   streamlit run ui.py --server.port=$PORT --server.address=0.0.0.0 --browser.gatherUsageStats=false
+   ```
+
+4. **Environment variables:**
+   - **`MERIDIAN_API_URL`** = your API’s public base URL, e.g. `https://meridian-assistant.onrender.com` (no trailing slash).
+   - The UI talks to the API over HTTP only; it does **not** need `GROQ_API_KEY` unless you change the app to call Groq from the browser (this project does not).
+
+5. Deploy, copy the new **`https://…onrender.com`** URL — **open that** in the browser for the chat UI.
+
+6. Go back to the **API** service → **Environment** → set **`CORS_ORIGINS`** to include the Streamlit URL → **save** (API will redeploy).
+
+### Fly.io (sketch)
+
+Same idea as Render: **two apps** (or two processes with explicit routing), API on `uvicorn` with `$PORT`, UI on Streamlit with `MERIDIAN_API_URL` pointing at the API, and `CORS_ORIGINS` on the API matching the UI origin.
+
+### C) Streamlit Community Cloud (UI only)
+
+Host **only** the Streamlit app on [Streamlit Community Cloud](https://streamlit.io/cloud); keep the FastAPI API on Render, Cloud Run, etc. The UI calls the API with **server-side** `httpx`, so you normally **do not** need to add Streamlit’s URL to API `CORS_ORIGINS`.
+
+1. Sign in at [streamlit.io/cloud](https://streamlit.io/cloud) with **GitHub**.
+2. **Create app** (or **New app**) → pick this **repository** and branch (e.g. `main`).
+3. **Main file path:** `ui.py` (not the default `streamlit_app.py`).
+4. **Python version:** 3.10+ (match your local setup if prompted).
+5. Open **App settings → Secrets** and add TOML, for example:
+
+   ```toml
+   MERIDIAN_API_URL = "https://meridian-assistant.onrender.com"
+   ```
+
+   Optional: `MERIDIAN_CHAT_TIMEOUT = "180"` (seconds).
+
+6. **Deploy.** After the build, Streamlit gives you a public app URL; pushes to the connected branch redeploy automatically.
+
+`ui.py` reads `MERIDIAN_API_URL` from the environment **or** from `st.secrets` so local `.env` / Docker and Community Cloud both work.
 
 ---
 
