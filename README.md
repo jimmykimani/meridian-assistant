@@ -1,6 +1,6 @@
-# Meridian Electronics — MCP support chatbot
+# Meridian Support
 
-AI customer support prototype: **Groq** (Llama, tool calling) + **Meridian order MCP** (Streamable HTTP). **FastAPI** exposes `/chat`; **Streamlit** is the demo UI.
+AI customer support prototype for Meridian Electronics: **Groq** (Llama, tool calling) + **Meridian order MCP** (Streamable HTTP). **FastAPI** exposes `/chat`; **Streamlit** is the demo UI.
 
 ## Prerequisites
 
@@ -103,5 +103,4 @@ pytest tests/ -m "not integration" -v
 ## Docs
 
 - [docs/mcp-tools.md](docs/mcp-tools.md) — MCP tool inventory and phases
-- [docs/video2_midpoint_script.md](docs/video2_midpoint_script.md) — mid-point video talk track  
-- [docs/video3_final_presentation_script.md](docs/video3_final_presentation_script.md) — **final video**: demo lines, architecture walkthrough, honest assessment
+- [docs/test-customers.md](docs/test-customers.md) — test customer accounts

@@ -189,7 +189,7 @@ def _sidebar_account_panel() -> None:
 
 
 def _render_chat() -> None:
-    st.markdown("### Meridian assistant")
+    st.markdown("### Meridian Support")
     st.caption(
         "Ask about monitors, keyboards, stock, or shipping. "
         "Sign in from the sidebar **only** when you need account or order actions."
@@ -264,8 +264,8 @@ def main() -> None:
     _ensure_session_id()
 
     with st.sidebar:
-        st.markdown("### Meridian")
-        st.caption("Electronics support")
+        st.markdown("### Meridian Support")
+        st.caption("Meridian Electronics")
         st.divider()
         st.markdown(f"**API** `{API_BASE}`")
         try:
@@ -278,9 +278,9 @@ def main() -> None:
         if svc == "meridian-support-api":
             st.caption("Connected to Meridian API")
         elif svc:
-            st.warning(f"Port 8000 is `{svc}` — start this project’s API from the repo.")
+            st.warning(f"Port 8000 is `{svc}` — start Meridian Support’s API from the repo root.")
         elif ok:
-            st.warning("Unexpected API root — restart uvicorn from the assessment repo.")
+            st.warning("Unexpected API root — restart uvicorn from the Meridian Support repo root.")
 
         _sidebar_account_panel()
 
