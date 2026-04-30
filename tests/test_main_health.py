@@ -57,6 +57,15 @@ def test_session_status_unknown(api_client: TestClient) -> None:
     assert r.status_code == 404
 
 
+def test_chat_unknown_session_returns_410(api_client: TestClient) -> None:
+    r = api_client.post(
+        "/chat",
+        json={"session_id": "definitely-unknown-session-id", "message": "hello"},
+    )
+    assert r.status_code == 410
+    assert "session" in r.json().get("detail", "").lower()
+
+
 def test_logout_clears_auth(api_client: TestClient) -> None:
     sid = api_client.post("/sessions/new").json()["session_id"]
     r = api_client.post("/auth/logout", json={"session_id": sid})

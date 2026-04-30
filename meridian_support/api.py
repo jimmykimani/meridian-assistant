@@ -201,7 +201,15 @@ def _get_or_create_session(request: Request, session_id: str | None) -> Any:
         return sm.new_session()
     state = sm.get(session_id)
     if state is None:
-        return sm.new_session()
+        # Do not silently mint a new session: client would lose auth bound to the old id
+        # (common with multi-worker / cold restarts). Force an explicit refresh.
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "This chat session is no longer on the server (restart, scaling, or expiry). "
+                "Use Clear chat history or reload, then sign in again if needed."
+            ),
+        )
     return state
 
 
@@ -284,7 +292,13 @@ async def auth_verify(request: Request, body: AuthVerifyRequest) -> AuthVerifyRe
         try:
             session = sm.require(body.session_id)
         except KeyError:
-            session = sm.new_session()
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Unknown session_id. Use Clear chat history, then verify again "
+                    "(sessions are lost when the API restarts)."
+                ),
+            ) from None
     else:
         session = sm.new_session()
 
@@ -310,10 +324,22 @@ async def auth_verify(request: Request, body: AuthVerifyRequest) -> AuthVerifyRe
 
     session.authenticated_customer_id = cid
     session.authenticated_email = body.email.strip().lower()
+    # Drop pre-login chat turns so the model does not keep asking for PIN after a successful verify.
+    session.clear_conversation()
+    session.conversation.append(
+        {
+            "role": "assistant",
+            "content": (
+                "Meridian account sign-in succeeded for this session. "
+                "Help with orders, checkout, and account details without asking for email or PIN again "
+                "unless the customer signs out."
+            ),
+        }
+    )
     return AuthVerifyResponse(
         session_id=session.session_id,
         authenticated=True,
-        message="You are signed in. How can we help you today?",
+        message="You're signed in. You can place an order or ask about your purchases now.",
     )
 
 

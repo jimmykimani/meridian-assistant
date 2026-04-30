@@ -199,9 +199,18 @@ def _sidebar_account_panel() -> None:
                             )
                         st.error(f"[HTTP {r.status_code}] {detail}{extra}")
                     else:
-                        st.session_state.session_id = r.json().get("session_id")
+                        data = r.json()
+                        st.session_state.session_id = data.get("session_id") or st.session_state.session_id
                         _sync_server_auth()
-                        st.success("Verified. You can ask about your orders now.")
+                        # Match server-side cleared transcript so the model is not stuck on old "verify first" turns.
+                        st.session_state.messages = []
+                        welcome = (data.get("message") or "").strip() or (
+                            "You're signed in. You can place an order or ask about your purchases now."
+                        )
+                        st.session_state.messages.append(
+                            {"role": "assistant", "content": welcome, "meta": {}}
+                        )
+                        st.success("Signed in successfully — chat was refreshed for your account.")
                         st.rerun()
 
 
@@ -239,7 +248,19 @@ def _render_chat() -> None:
         try:
             with st.spinner("Thinking…"):
                 r = _post("/chat", payload)
-            if r.status_code >= 400:
+            if r.status_code == 410:
+                try:
+                    err_body = r.json().get("detail", r.text)
+                except Exception:
+                    err_body = r.text
+                st.session_state.session_id = None
+                st.session_state.messages = []
+                _ensure_session_id()
+                meta = {"error": err_body, "status_code": 410}
+                assistant_text = (
+                    f"{err_body}\n\nA new session was started—sign in again from the sidebar if you need your account."
+                )
+            elif r.status_code >= 400:
                 try:
                     err_body = r.json().get("detail", r.text)
                 except Exception:
