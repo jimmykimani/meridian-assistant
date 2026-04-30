@@ -14,8 +14,25 @@ import httpx
 import streamlit as st
 
 DEFAULT_API = "http://127.0.0.1:8000"
-API_BASE = os.environ.get("MERIDIAN_API_URL", DEFAULT_API).rstrip("/")
-CHAT_TIMEOUT = float(os.environ.get("MERIDIAN_CHAT_TIMEOUT", "180"))
+
+
+def _env_or_secret(key: str, default: str) -> str:
+    """Prefer shell/Docker env; use Streamlit Community Cloud secrets when unset."""
+    v = (os.environ.get(key) or "").strip()
+    if v:
+        return v
+    try:
+        out = st.secrets[key]
+    except (FileNotFoundError, KeyError, TypeError):
+        return default
+    if out is None:
+        return default
+    s = str(out).strip()
+    return s if s else default
+
+
+API_BASE = _env_or_secret("MERIDIAN_API_URL", DEFAULT_API).rstrip("/")
+CHAT_TIMEOUT = float(_env_or_secret("MERIDIAN_CHAT_TIMEOUT", "180"))
 
 
 def _inject_theme() -> None:
@@ -268,6 +285,7 @@ def main() -> None:
         st.caption("Meridian Electronics")
         st.divider()
         st.markdown(f"**API** `{API_BASE}`")
+        ok = False
         try:
             hr = _get("/health")
             ok = hr.status_code == 200 and hr.json().get("status") == "ok"
