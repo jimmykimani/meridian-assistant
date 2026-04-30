@@ -1,0 +1,406 @@
+"""
+Meridian support agent: Groq (Llama) tool-calling + MCP execution + auth gating.
+
+All business facts come from MCP tools discovered at runtime (no hardcoded tool list
+for behavior — only auth routing constants).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+from typing import Any
+
+from openai import APIStatusError, AsyncOpenAI, RateLimitError
+
+from mcp_client import MCPClient
+from schema_utils import simplify_schema_for_gemini
+from session_manager import SessionState
+from settings import Settings
+
+logger = logging.getLogger(__name__)
+
+SYSTEM_INSTRUCTION = """You are Meridian Support for Meridian Electronics (monitors, keyboards, printers, networking, accessories).
+
+Anonymous customers (no verification yet):
+- Help immediately with product discovery: search, compare, availability, and general questions. Use list_products, search_products, and get_product freely.
+- Keep the experience fast and friendly—no login lecture unless they ask for something sensitive.
+
+Sensitive actions (require verification first):
+- Order history, order details, account/profile data, or placing an order need a verified customer.
+- If you need verification, say clearly: "I can help with that—please verify your Meridian account first" and explain they can use their **email + 4-digit PIN** when ready. Then call **verify_customer_pin** only after they provide email and PIN (never echo the PIN).
+- If a tool result contains `"error": "authentication_required"`, treat it as "not verified yet": give that same guidance; do not pretend you showed orders.
+
+After successful verify_customer_pin:
+- Use tools for that customer's orders and profile; do not ask them to paste UUIDs.
+
+Honesty:
+- Use MCP tools for facts—never invent SKUs, prices, or order IDs.
+- Refunds are out of scope—direct to human support.
+- Keep replies concise and professional."""
+
+PUBLIC_TOOLS = frozenset({"list_products", "get_product", "search_products"})
+SENSITIVE_TOOLS = frozenset({"get_customer", "list_orders", "get_order", "create_order"})
+VERIFY_TOOL = "verify_customer_pin"
+
+UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+
+INJECTION_MARKERS = (
+    "ignore previous",
+    "ignore all previous",
+    "disregard previous",
+    "system prompt",
+    "you are now",
+    "developer message",
+    "override instructions",
+)
+
+
+def detect_prompt_injection(user_text: str) -> str | None:
+    low = user_text.lower()
+    for marker in INJECTION_MARKERS:
+        if marker in low:
+            return marker
+    return None
+
+
+def extract_customer_id_from_tool_result(result: Any) -> str | None:
+    if isinstance(result, dict):
+        for key in ("customer_id", "id", "customerId"):
+            val = result.get(key)
+            if isinstance(val, str) and UUID_RE.fullmatch(val.strip()):
+                return val.strip().lower()
+    if isinstance(result, str):
+        m = UUID_RE.search(result)
+        if m:
+            return m.group(0).lower()
+    return None
+
+
+def _mcp_tools_to_openai_tools(mcp_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for t in mcp_tools:
+        if not isinstance(t, dict) or "name" not in t:
+            continue
+        name = str(t["name"])
+        desc = (t.get("description") or "")[:8000]
+        raw_schema = t.get("inputSchema") or {"type": "object", "properties": {}}
+        schema = simplify_schema_for_gemini(raw_schema)
+        out.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": desc,
+                    "parameters": schema,
+                },
+            }
+        )
+    return out
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return None
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _trim_messages(messages: list[dict[str, Any]], max_turns: int) -> list[dict[str, Any]]:
+    """Keep system + recent tail so tool/user/assistant chains stay valid."""
+    if not messages:
+        return messages
+    system = messages[0] if messages[0].get("role") == "system" else None
+    rest = messages[1:] if system else messages
+    cap = max(6, max_turns * 3)
+    if len(rest) <= cap:
+        trimmed = rest
+    else:
+        trimmed = rest[-cap:]
+    return ([system] + trimmed) if system else trimmed
+
+
+class MeridianAgent:
+    def __init__(self, settings: Settings, mcp: MCPClient) -> None:
+        self._settings = settings
+        self._mcp = mcp
+        self._client = AsyncOpenAI(
+            api_key=settings.groq_api_key,
+            base_url="https://api.groq.com/openai/v1",
+        )
+        self._model_id = settings.groq_model
+        self._openai_tools: list[dict[str, Any]] | None = None
+        self._tool_names: set[str] = set()
+
+    async def aclose(self) -> None:
+        await self._client.close()
+
+    async def _chat_completion(self, **kwargs: Any) -> Any:
+        """Groq free tier often returns 429; wait and retry with exponential backoff."""
+        attempts = self._settings.groq_completion_retries
+        base = self._settings.groq_retry_base_sec
+        last: BaseException | None = None
+        for attempt in range(attempts):
+            try:
+                return await self._client.chat.completions.create(**kwargs)
+            except RateLimitError as exc:
+                last = exc
+                if attempt >= attempts - 1:
+                    raise
+                wait = _retry_after_seconds(exc)
+                if wait is None:
+                    wait = min(60.0, base * (2**attempt))
+                logger.warning(
+                    "Groq rate limited, retry %s/%s after %.1fs",
+                    attempt + 1,
+                    attempts,
+                    wait,
+                )
+                await asyncio.sleep(wait)
+            except APIStatusError as exc:
+                if getattr(exc, "status_code", None) != 429:
+                    raise
+                last = exc
+                if attempt >= attempts - 1:
+                    raise
+                wait = _retry_after_seconds(exc)
+                if wait is None:
+                    wait = min(60.0, base * (2**attempt))
+                logger.warning(
+                    "Groq HTTP 429, retry %s/%s after %.1fs",
+                    attempt + 1,
+                    attempts,
+                    wait,
+                )
+                await asyncio.sleep(wait)
+        assert last is not None
+        raise last
+
+    async def _ensure_tools(self) -> list[dict[str, Any]]:
+        if self._openai_tools is not None:
+            return self._openai_tools
+        mcp_tools = await self._mcp.list_tools()
+        self._tool_names = {str(t["name"]) for t in mcp_tools if isinstance(t, dict) and "name" in t}
+        self._openai_tools = _mcp_tools_to_openai_tools(mcp_tools)
+        return self._openai_tools
+
+    def _build_messages(self, session: SessionState, user_message: str) -> list[dict[str, Any]]:
+        prior = list(session.conversation)
+        max_items = max(6, self._settings.max_history_turns * 3)
+        if len(prior) > max_items:
+            prior = prior[-max_items:]
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            *prior,
+            {"role": "user", "content": user_message},
+        ]
+        return _trim_messages(messages, self._settings.max_history_turns)
+
+    async def _execute_tool(
+        self,
+        session: SessionState,
+        name: str,
+        args: dict[str, Any],
+    ) -> tuple[Any, bool]:
+        """
+        Returns (payload_for_model, auth_gate_fired).
+        auth_gate_fired True if we blocked a sensitive tool due to missing auth.
+        """
+        if name not in self._tool_names:
+            return {"error": f"Unknown tool {name!r}"}, False
+
+        if name in SENSITIVE_TOOLS and not session.authenticated_customer_id:
+            return {
+                "error": "authentication_required",
+                "guidance": (
+                    "Customer is not verified. Reply warmly: you can help with products now; "
+                    "for this request they should verify with Meridian email + 4-digit PIN "
+                    "(then you can call verify_customer_pin)."
+                ),
+            }, True
+
+        if name == VERIFY_TOOL:
+            session.reset_auth()
+            return await self._mcp.call_tool(name, args), False
+
+        if name in PUBLIC_TOOLS:
+            return await self._mcp.call_tool(name, args), False
+
+        args = dict(args or {})
+
+        if name in ("get_customer", "list_orders", "create_order"):
+            cid = session.authenticated_customer_id
+            if cid:
+                args["customer_id"] = cid
+
+        if name == "get_order" and not session.authenticated_customer_id:
+            return {"error": "authentication_required"}, True
+
+        return await self._mcp.call_tool(name, args), False
+
+    def _record_verify_outcome(
+        self, session: SessionState, tool_result: Any, args: dict[str, Any]
+    ) -> None:
+        cid = extract_customer_id_from_tool_result(tool_result)
+        if not cid:
+            return
+        session.authenticated_customer_id = cid
+        email = args.get("email")
+        if isinstance(email, str):
+            session.authenticated_email = email.strip().lower() or None
+
+    async def chat(self, session: SessionState, user_message: str) -> dict[str, Any]:
+        marker = detect_prompt_injection(user_message)
+        if marker:
+            return {
+                "message": (
+                    "I can only help with Meridian product and order questions. "
+                    "Please rephrase your request without meta-instructions."
+                ),
+                "requires_auth": not bool(session.authenticated_customer_id),
+                "tool_used": None,
+                "confidence": 0.95,
+            }
+
+        tools = await self._ensure_tools()
+        messages = self._build_messages(session, user_message)
+
+        last_tool: str | None = None
+        auth_gate_fired = False
+        tool_error = False
+
+        for _round in range(self._settings.max_tool_rounds):
+            response = await self._chat_completion(
+                model=self._model_id,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=0.25,
+                max_tokens=1024,
+            )
+            choice = response.choices[0]
+            msg = choice.message
+
+            tool_calls = getattr(msg, "tool_calls", None) or []
+            if not tool_calls:
+                final_text = (msg.content or "").strip() or (
+                    "I could not generate a response. Please try again in a moment."
+                )
+                assistant_entry: dict[str, Any] = {"role": "assistant", "content": final_text}
+                messages.append(assistant_entry)
+                session.conversation = messages[1:]
+                return self._structured(
+                    message=final_text,
+                    session=session,
+                    tool_used=last_tool,
+                    auth_gate_fired=auth_gate_fired,
+                    tool_error=tool_error,
+                )
+
+            assistant_entry = {
+                "role": "assistant",
+                "content": msg.content or None,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments or "{}",
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            }
+            messages.append(assistant_entry)
+
+            for tc in tool_calls:
+                name = tc.function.name
+                raw_args = tc.function.arguments or "{}"
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+                except json.JSONDecodeError:
+                    args = {}
+                if not isinstance(args, dict):
+                    args = {}
+                last_tool = name
+                try:
+                    payload, gated = await self._execute_tool(session, name, args)
+                    if gated:
+                        auth_gate_fired = True
+                    if isinstance(payload, dict) and payload.get("error"):
+                        tool_error = True
+                    if name == VERIFY_TOOL:
+                        self._record_verify_outcome(session, payload, args)
+                except Exception as exc:
+                    tool_error = True
+                    payload = {"error": str(exc)}
+                    logger.exception("Tool %s failed", name)
+
+                if isinstance(payload, (dict, list)):
+                    fr_body: dict[str, Any] = {"result": payload}
+                else:
+                    fr_body = {"result": str(payload)}
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps(fr_body),
+                    }
+                )
+
+        final_text = (
+            "I reached my internal limit for tool actions on that request. "
+            "Please narrow the question or contact Meridian support."
+        )
+        messages.append({"role": "assistant", "content": final_text})
+        session.conversation = messages[1:]
+        return self._structured(
+            message=final_text,
+            session=session,
+            tool_used=last_tool,
+            auth_gate_fired=auth_gate_fired,
+            tool_error=True,
+        )
+
+    @staticmethod
+    def _structured(
+        *,
+        message: str,
+        session: SessionState,
+        tool_used: str | None,
+        auth_gate_fired: bool,
+        tool_error: bool,
+    ) -> dict[str, Any]:
+        requires_auth = not session.authenticated_customer_id and (
+            auth_gate_fired or (tool_used == VERIFY_TOOL and tool_error)
+        )
+
+        confidence = 0.82
+        if tool_error:
+            confidence -= 0.15
+        if auth_gate_fired:
+            confidence -= 0.05
+        confidence = max(0.0, min(1.0, confidence))
+
+        return {
+            "message": message,
+            "requires_auth": bool(requires_auth),
+            "tool_used": tool_used,
+            "confidence": round(confidence, 2),
+        }
