@@ -117,6 +117,14 @@ Or directly:
 pytest tests/ -m "not integration" -v
 ```
 
+**Groq + every MCP tool path (slow, real network):** with `.env` configured, run:
+
+```bash
+python3 scripts/verify_tools_llm.py
+```
+
+(`create_order` is not auto-run; use the UI when you want to exercise that tool.)
+
 ## Docs
 
 - [docs/mcp-tools.md](docs/mcp-tools.md) — MCP tool inventory and phases
