@@ -504,8 +504,15 @@ class MeridianAgent:
         max_items = max(6, self._settings.max_history_turns * 3)
         if len(prior) > max_items:
             prior = prior[-max_items:]
+        system_text = SYSTEM_INSTRUCTION
+        if session.authenticated_customer_id:
+            system_text += (
+                "\n\n**Already signed in:** This session is verified with Meridian. "
+                "Do **not** ask for email or PIN again, and do **not** claim their credentials were wrong, "
+                "unless an MCP tool just returned a verification error. For orders, confirm SKU/qty and use **create_order**."
+            )
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {"role": "system", "content": system_text},
             *prior,
             {"role": "user", "content": user_message},
         ]
