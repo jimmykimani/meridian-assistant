@@ -8,6 +8,7 @@ customers need orders, account details, or purchases.
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 from typing import Any
@@ -36,6 +37,11 @@ def _env_or_secret(key: str, default: str) -> str:
 
 API_BASE = _env_or_secret("MERIDIAN_API_URL", DEFAULT_API).rstrip("/")
 CHAT_TIMEOUT = float(_env_or_secret("MERIDIAN_CHAT_TIMEOUT", "180"))
+_SHOW_API_URL = _env_or_secret("MERIDIAN_SHOW_API_URL", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # SKUs as shown by the assistant, e.g. [COM-0012] …
 _SKU_IN_BRACKETS = re.compile(r"\[([A-Z][A-Z0-9]{1,11}-\d+)\]")
@@ -53,32 +59,22 @@ def _extract_skus_from_message(text: str) -> list[str]:
 
 
 def _assistant_copy_buttons(content: str, *, component_key: str) -> None:
-    """Per-assistant-message SKU chips + copy full reply (runs in an isolated iframe)."""
+    """Per-assistant-message SKU copy chips (isolated iframe)."""
     skus = _extract_skus_from_message(content)[:16]
-    safe_id = re.sub(r"[^a-zA-Z0-9]", "_", component_key)[:48] or "cid"
-    esc_full = html.escape(content)
-    sku_row = ""
-    if skus:
-        chips = "".join(
-            f'<button type="button" class="mer-sku" data-sku="{html.escape(sku, quote=True)}">'
-            f"{html.escape(sku)}</button>"
-            for sku in skus
-        )
-        sku_row = (
-            f'<div class="mer-row"><span class="mer-hint">Copy SKU</span>{chips}</div>'
-        )
+    if not skus:
+        return
+    chips = "".join(
+        f'<button type="button" class="mer-sku" data-sku="{html.escape(sku, quote=True)}">'
+        f"{html.escape(sku)}</button>"
+        for sku in skus
+    )
+    sku_row = f'<div class="mer-row"><span class="mer-hint">Copy SKU</span>{chips}</div>'
     html_block = f"""
-<div class="mer-tools">
-  <textarea id="mer_full_{safe_id}" readonly class="mer-ta">{esc_full}</textarea>
+<div class="mer-tools" data-mer="{html.escape(component_key[:80], quote=True)}">
   {sku_row}
-  <div class="mer-row">
-    <button type="button" class="mer-full" id="mer_btn_{safe_id}">Copy full reply</button>
-  </div>
 </div>
 <script>
 (function() {{
-  var ta = document.getElementById("mer_full_{safe_id}");
-  var bf = document.getElementById("mer_btn_{safe_id}");
   document.querySelectorAll(".mer-sku").forEach(function(b) {{
     b.addEventListener("click", function() {{
       var sku = b.getAttribute("data-sku") || b.textContent;
@@ -87,30 +83,20 @@ def _assistant_copy_buttons(content: str, *, component_key: str) -> None:
       }}).catch(function() {{}});
     }});
   }});
-  if (bf && ta) {{
-    bf.addEventListener("click", function() {{
-      navigator.clipboard.writeText(ta.value).then(function() {{
-        bf.textContent = "Copied!";
-        setTimeout(function() {{ bf.textContent = "Copy full reply"; }}, 1600);
-      }}).catch(function() {{}});
-    }});
-  }}
 }})();
 </script>
 <style>
 .mer-tools {{ font-family: 'Plus Jakarta Sans', system-ui, sans-serif; margin-top: 0.25rem; }}
-.mer-ta {{ position: absolute; left: -9999px; width: 1px; height: 1px; opacity: 0; }}
 .mer-row {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; margin-top: 0.3rem; }}
 .mer-hint {{ font-size: 0.7rem; color: #94a3b8; margin-right: 0.1rem; }}
-.mer-sku, .mer-full {{
+.mer-sku {{
   font-size: 0.72rem; padding: 0.28rem 0.6rem; border-radius: 8px;
   border: 1px solid rgba(148,163,184,0.45); background: rgba(51,65,85,0.9);
   color: #f8fafc; cursor: pointer;
 }}
-.mer-full {{ font-weight: 600; }}
 </style>
 """
-    h = 100 if skus else 52
+    h = max(44, 28 + (len(skus) // 4) * 28)
     components.html(html_block, height=h, scrolling=False)
 
 
@@ -167,6 +153,41 @@ def _get(path: str) -> httpx.Response:
 def _post(path: str, payload: dict[str, Any]) -> httpx.Response:
     with httpx.Client(timeout=CHAT_TIMEOUT) as client:
         return client.post(f"{API_BASE}{path}", json=payload)
+
+
+def _decode_json_chat(r: httpx.Response) -> tuple[str, dict[str, Any], str | None]:
+    """
+    Parse ``POST /chat`` JSON. Returns (assistant_text, meta, session_id_or_none).
+    Does not touch ``st.session_state`` (caller applies session_id).
+    """
+    meta: dict[str, Any] = {}
+    if r.status_code == 410:
+        try:
+            err_body = r.json().get("detail", r.text)
+        except Exception:
+            err_body = r.text
+        meta = {"error": err_body, "status_code": 410}
+        return (
+            f"{err_body}\n\nA new session was started—sign in again from the sidebar if you need your account.",
+            meta,
+            None,
+        )
+    if r.status_code >= 400:
+        try:
+            err_body = r.json().get("detail", r.text)
+        except Exception:
+            err_body = r.text
+        meta = {"error": err_body, "status_code": r.status_code}
+        return str(err_body), meta, None
+    data = r.json()
+    assistant_text = data.get("message", "") or ""
+    meta = {
+        "requires_auth": data.get("requires_auth"),
+        "tool_used": data.get("tool_used"),
+        "confidence": data.get("confidence"),
+    }
+    sid = data.get("session_id")
+    return assistant_text, meta, str(sid).strip() if sid else None
 
 
 _VERIFY_PATHS = ("/auth/verify", "/login", "/verify")
@@ -329,40 +350,87 @@ def _render_chat() -> None:
 
         assistant_text = ""
         meta: dict[str, Any] = {}
-        try:
-            with st.spinner("Thinking…"):
-                r = _post("/chat", payload)
-            if r.status_code == 410:
-                try:
-                    err_body = r.json().get("detail", r.text)
-                except Exception:
-                    err_body = r.text
-                st.session_state.session_id = None
-                st.session_state.messages = []
-                _ensure_session_id()
-                meta = {"error": err_body, "status_code": 410}
-                assistant_text = (
-                    f"{err_body}\n\nA new session was started—sign in again from the sidebar if you need your account."
-                )
-            elif r.status_code >= 400:
-                try:
-                    err_body = r.json().get("detail", r.text)
-                except Exception:
-                    err_body = r.text
-                meta = {"error": err_body, "status_code": r.status_code}
-                assistant_text = str(err_body)
-            else:
-                data = r.json()
-                st.session_state.session_id = data.get("session_id") or st.session_state.session_id
-                assistant_text = data.get("message", "") or ""
-                meta = {
-                    "requires_auth": data.get("requires_auth"),
-                    "tool_used": data.get("tool_used"),
-                    "confidence": data.get("confidence"),
-                }
-        except Exception as exc:
-            meta = {"error": str(exc)}
-            assistant_text = str(exc)
+        with st.chat_message("assistant"):
+            slot = st.empty()
+            slot.caption("Thinking…")
+            try:
+                with httpx.Client(timeout=CHAT_TIMEOUT) as client:
+                    with client.stream("POST", f"{API_BASE}/chat/stream", json=payload) as r:
+                        if r.status_code == 404:
+                            fb = _post("/chat", payload)
+                            assistant_text, meta, sid = _decode_json_chat(fb)
+                            if sid:
+                                st.session_state.session_id = sid
+                            if meta.get("status_code") == 410:
+                                st.session_state.session_id = None
+                                st.session_state.messages = []
+                                _ensure_session_id()
+                            slot.markdown(assistant_text)
+                        elif r.status_code == 410:
+                            raw = r.read()
+                            try:
+                                err_body = json.loads(raw).get("detail", raw.decode("utf-8", errors="replace"))
+                            except Exception:
+                                err_body = raw.decode("utf-8", errors="replace")
+                            st.session_state.session_id = None
+                            st.session_state.messages = []
+                            _ensure_session_id()
+                            meta = {"error": err_body, "status_code": 410}
+                            assistant_text = (
+                                f"{err_body}\n\nA new session was started—sign in again from the sidebar if you need your account."
+                            )
+                            slot.markdown(assistant_text)
+                        elif r.status_code >= 400:
+                            raw = r.read()
+                            try:
+                                err_body = json.loads(raw).get("detail", raw.decode("utf-8", errors="replace"))
+                            except Exception:
+                                err_body = raw.decode("utf-8", errors="replace")
+                            meta = {"error": err_body, "status_code": r.status_code}
+                            assistant_text = str(err_body)
+                            slot.markdown(assistant_text)
+                        else:
+                            saw_final = False
+                            buf = ""
+                            for line in r.iter_lines():
+                                if not line or not str(line).strip():
+                                    continue
+                                try:
+                                    ev = json.loads(line)
+                                except json.JSONDecodeError:
+                                    continue
+                                ev_type = ev.get("event")
+                                if ev_type == "delta":
+                                    buf += str(ev.get("text", ""))
+                                    slot.markdown(buf + "▌")
+                                elif ev_type == "final":
+                                    saw_final = True
+                                    assistant_text = str(ev.get("message", buf))
+                                    meta = {
+                                        "requires_auth": ev.get("requires_auth"),
+                                        "tool_used": ev.get("tool_used"),
+                                        "confidence": ev.get("confidence"),
+                                    }
+                                    sid = ev.get("session_id")
+                                    if sid:
+                                        st.session_state.session_id = sid
+                                    slot.markdown(assistant_text)
+                                elif ev_type == "error":
+                                    meta = {
+                                        "error": ev.get("detail", "stream error"),
+                                        "status_code": ev.get("status_code", 502),
+                                    }
+                                    assistant_text = str(ev.get("detail", buf))
+                                    slot.markdown(assistant_text)
+                                    saw_final = True
+                            if not saw_final and not meta.get("error"):
+                                meta = {"error": "Stream ended without a final event", "status_code": 502}
+                                assistant_text = buf or "No response from the assistant."
+                                slot.markdown(assistant_text)
+            except Exception as exc:
+                meta = {"error": str(exc)}
+                assistant_text = str(exc)
+                slot.markdown(assistant_text)
 
         st.session_state.messages.append(
             {"role": "assistant", "content": assistant_text, "meta": meta}
@@ -385,7 +453,9 @@ def main() -> None:
         st.markdown("### Meridian Support")
         st.caption("Meridian Electronics")
         st.divider()
-        st.markdown(f"**API** `{API_BASE}`")
+        if _SHOW_API_URL:
+            with st.expander("Developer — API base URL"):
+                st.code(API_BASE, language="text")
         ok = False
         try:
             hr = _get("/health")

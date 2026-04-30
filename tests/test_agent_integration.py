@@ -5,9 +5,9 @@ import os
 import pytest
 
 from meridian_support.agent import MeridianAgent
-from meridian_support.mcp_client import MCPClient
-from meridian_support.session_manager import SessionManager
-from meridian_support.settings import Settings
+from meridian_support.configs.settings import Settings
+from meridian_support.services.sessions import SessionManager
+from meridian_support.tools.mcp_client import MCPClient
 
 
 pytestmark = pytest.mark.skipif(

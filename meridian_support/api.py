@@ -2,22 +2,34 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from openai import APIStatusError, AuthenticationError, RateLimitError
-from pydantic import BaseModel, Field
 
 from meridian_support.agent import MeridianAgent, extract_customer_id_from_tool_result
 from meridian_support.auth_utils import mask_email
-from meridian_support.mcp_client import MCPClient
-from meridian_support.session_manager import SessionManager
-from meridian_support.settings import Settings
+from meridian_support.configs.settings import Settings
+from meridian_support.models.schemas import (
+    AuthVerifyRequest,
+    AuthVerifyResponse,
+    ChatRequest,
+    ChatResponse,
+    NewSessionResponse,
+    ResetSessionRequest,
+    SessionStatusResponse,
+)
+from meridian_support.services.catalog_shortcut import try_serve_catalog_shortcut
+from meridian_support.services.sessions import SessionManager, SessionState
+from meridian_support.tools.mcp_client import MCPClient
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +73,9 @@ def _http_exception_from_groq(exc: APIStatusError) -> HTTPException:
         return HTTPException(
             status_code=502,
             detail=(
-                "That message or conversation is too large for the AI. "
-                "Try a shorter question, fewer products at once, or clear chat history."
+                "That’s more than we can process in one go. Try asking for a **category** "
+                "(e.g. monitors, keyboards), **up to ~15 items**, or use **Clear chat history** "
+                "for a fresh start—then we can keep helping you shop."
             ),
         )
     if code == 400:
@@ -72,8 +85,8 @@ def _http_exception_from_groq(exc: APIStatusError) -> HTTPException:
             return HTTPException(
                 status_code=502,
                 detail=(
-                    "That request is too long for the AI context window. "
-                    "Shorten your message or clear older chat and try again."
+                    "This conversation got a bit long for one step. Try a shorter question, "
+                    "ask for one **category** at a time, or **Clear chat history** and continue."
                 ),
             )
         if "tool" in low and ("invalid" in low or "parse" in low or "json" in low or "schema" in low):
@@ -160,41 +173,6 @@ app.add_middleware(
 )
 
 
-class ChatRequest(BaseModel):
-    session_id: str | None = None
-    message: str = Field(..., min_length=1, max_length=8000)
-
-
-class ChatResponse(BaseModel):
-    session_id: str
-    message: str
-    requires_auth: bool
-    tool_used: str | None = None
-    confidence: float = Field(..., ge=0.0, le=1.0)
-
-
-class NewSessionResponse(BaseModel):
-    session_id: str
-
-
-class SessionStatusResponse(BaseModel):
-    session_id: str
-    authenticated: bool
-    email_masked: str | None = None
-
-
-class AuthVerifyRequest(BaseModel):
-    session_id: str | None = None
-    email: str = Field(..., min_length=3, max_length=320)
-    pin: str = Field(..., min_length=4, max_length=32)
-
-
-class AuthVerifyResponse(BaseModel):
-    session_id: str
-    authenticated: bool
-    message: str
-
-
 def _get_or_create_session(request: Request, session_id: str | None) -> Any:
     """Reuse existing session or create a new one (anonymous browsing allowed)."""
     sm: SessionManager = request.app.state.sessions
@@ -237,10 +215,6 @@ async def new_session(request: Request) -> NewSessionResponse:
     sm: SessionManager = request.app.state.sessions
     s = sm.new_session()
     return NewSessionResponse(session_id=s.session_id)
-
-
-class ResetSessionRequest(BaseModel):
-    session_id: str = Field(..., min_length=1)
 
 
 @app.post("/sessions/reset", response_model=NewSessionResponse)
@@ -364,10 +338,28 @@ async def auth_logout(request: Request, body: ResetSessionRequest) -> SessionSta
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     agent: MeridianAgent = request.app.state.agent
+    mcp: MCPClient = request.app.state.mcp
     session = _get_or_create_session(request, body.session_id)
     t0 = time.perf_counter()
+    text = body.message.strip()
+    bypass = await try_serve_catalog_shortcut(mcp, session, text)
+    if bypass is not None:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        logger.info(
+            "chat catalog bypass session_id=%s ms=%.0f chars=%s",
+            session.session_id,
+            elapsed_ms,
+            len(bypass["message"]),
+        )
+        return ChatResponse(
+            session_id=session.session_id,
+            message=bypass["message"],
+            requires_auth=bool(bypass["requires_auth"]),
+            tool_used=bypass.get("tool_used"),
+            confidence=float(bypass["confidence"]),
+        )
     try:
-        out = await agent.chat(session, body.message.strip())
+        out = await agent.chat(session, text)
     except RuntimeError as exc:
         logger.warning("chat failed: %s", exc)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -410,4 +402,116 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
         requires_auth=bool(out.get("requires_auth")),
         tool_used=out.get("tool_used"),
         confidence=float(out.get("confidence", 0.75)),
+    )
+
+
+@app.post("/chat/stream")
+async def chat_stream(request: Request, body: ChatRequest) -> StreamingResponse:
+    """
+    NDJSON stream of chat events (one JSON object per line).
+
+    Lines are either ``{"event":"delta","text":"..."}`` fragments or a single
+    ``{"event":"final",...}`` with the same fields as ``POST /chat``.
+    """
+    agent: MeridianAgent = request.app.state.agent
+    mcp: MCPClient = request.app.state.mcp
+    session = _get_or_create_session(request, body.session_id)
+
+    async def ndjson_body() -> AsyncIterator[str]:
+        t0 = time.perf_counter()
+        text = body.message.strip()
+        bypass = await try_serve_catalog_shortcut(mcp, session, text)
+        if bypass is not None:
+            msg = bypass["message"]
+            chunk_n = max(500, int(os.environ.get("MERIDIAN_CATALOG_STREAM_CHUNK", "1600")))
+            for i in range(0, len(msg), chunk_n):
+                yield json.dumps(
+                    {"event": "delta", "text": msg[i : i + chunk_n]},
+                    ensure_ascii=False,
+                ) + "\n"
+            yield json.dumps(
+                {
+                    "event": "final",
+                    "session_id": session.session_id,
+                    "message": msg,
+                    "requires_auth": bool(bypass.get("requires_auth")),
+                    "tool_used": bypass.get("tool_used"),
+                    "confidence": float(bypass.get("confidence", 0.99)),
+                },
+                ensure_ascii=False,
+            ) + "\n"
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            logger.info(
+                "chat stream catalog bypass session_id=%s ms=%.0f chars=%s",
+                session.session_id,
+                elapsed_ms,
+                len(msg),
+            )
+            return
+
+        last_final: dict[str, Any] | None = None
+        try:
+            async for ev in agent.chat_stream(session, text):
+                if isinstance(ev, dict) and ev.get("event") == "final":
+                    last_final = ev
+                yield json.dumps(ev, ensure_ascii=False) + "\n"
+            if last_final:
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                logger.info(
+                    "chat stream ok session_id=%s ms=%.0f tool_used=%s requires_auth=%s",
+                    session.session_id,
+                    elapsed_ms,
+                    last_final.get("tool_used"),
+                    bool(last_final.get("requires_auth")),
+                )
+        except RuntimeError as exc:
+            logger.warning("chat stream failed: %s", exc)
+            yield json.dumps({"event": "error", "detail": str(exc)}, ensure_ascii=False) + "\n"
+        except RateLimitError as exc:
+            logger.warning("Groq rate limit (stream): %s", exc)
+            yield json.dumps(
+                {
+                    "event": "error",
+                    "detail": (
+                        "Groq rate limit or quota hit. Wait and retry, or check your plan at "
+                        "https://console.groq.com/"
+                    ),
+                    "status_code": 429,
+                },
+                ensure_ascii=False,
+            ) + "\n"
+        except AuthenticationError as exc:
+            logger.warning("Groq auth failed (stream): %s", exc)
+            yield json.dumps(
+                {
+                    "event": "error",
+                    "detail": "Groq rejected the request (check GROQ_API_KEY).",
+                    "status_code": 403,
+                },
+                ensure_ascii=False,
+            ) + "\n"
+        except APIStatusError as exc:
+            he = _http_exception_from_groq(exc)
+            yield json.dumps(
+                {"event": "error", "detail": he.detail, "status_code": he.status_code},
+                ensure_ascii=False,
+            ) + "\n"
+        except Exception:
+            logger.exception("chat stream failed")
+            yield json.dumps(
+                {
+                    "event": "error",
+                    "detail": "An unexpected error occurred. Please try again.",
+                    "status_code": 500,
+                },
+                ensure_ascii=False,
+            ) + "\n"
+
+    return StreamingResponse(
+        ndjson_body(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )

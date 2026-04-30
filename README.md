@@ -57,21 +57,26 @@ Test logins (exact strings): [docs/test-customers.md](docs/test-customers.md).
 | POST | `/sessions/reset` | JSON `{"session_id"}` — clear auth + chat |
 | POST | `/sessions/clear-chat` | JSON `{"session_id"}` — clear transcript only (keeps auth) |
 | POST | `/chat` | JSON `{"message", "session_id"?}` — **anonymous OK** |
+| POST | `/chat/stream` | Same body as `/chat`; **NDJSON** stream (`event`: `delta` with `text`, then `final` with same fields as `/chat`) |
 
-`POST /chat` response: `session_id`, `message`, `requires_auth`, `tool_used`, `confidence`.
+`POST /chat` response: `session_id`, `message`, `requires_auth`, `tool_used`, `confidence`. Phrases like **“show all products”** are handled with a **direct MCP `list_products` bypass** (no Groq), so the full catalog is returned without the old “message too large” failure. The Streamlit app uses **`/chat/stream`** for token-by-token rendering and falls back to **`/chat`** if the server returns 404.
 
 ## Environment variables
 
 | Variable | Purpose |
 |----------|--------|
 | `GROQ_API_KEY` | Required |
-| `GROQ_MODEL` | Optional, default `llama-3.1-8b-instant` (use `llama-3.3-70b-versatile` for heavier reasoning) |
+| `GROQ_MODEL` | Optional, default **`llama-3.1-8b-instant`** (fast; use `llama-3.3-70b-versatile` for heavier reasoning) |
 | `GROQ_COMPLETION_RETRIES` | Optional, default `6` (each agent round retries on 429) |
 | `GROQ_RETRY_BASE_SEC` | Optional, default `1.5` (exponential backoff cap 60s) |
-| `MAX_TOOL_RESULT_CHARS` | Optional, default `5000` — max characters of each MCP tool result sent back to Groq (avoids HTTP 413) |
+| `MAX_TOOL_RESULT_CHARS` | Optional, default `10000` — max characters of each MCP tool result per round (lower if you still see HTTP 413) |
+| `MAX_ASSISTANT_CHARS_IN_CONTEXT` | Optional, default `8000` — when sending history to Groq, older assistant replies are truncated to this length (full text stays in the UI; **“show all products”** uses a server bypass and does not rely on Groq for the list) |
+| `MERIDIAN_CATALOG_RESPONSE_MAX_CHARS` | Optional, default `250000` — max characters returned for the full-catalog bypass |
+| `MERIDIAN_CATALOG_STREAM_CHUNK` | Optional, default `1600` — NDJSON chunk size for streaming that bypass |
 | `MCP_SERVER_URL` | Optional override for MCP endpoint |
 | `MERIDIAN_API_URL` | Streamlit → API base (default `http://127.0.0.1:8000`) |
 | `MERIDIAN_CHAT_TIMEOUT` | Streamlit HTTP timeout seconds (default `180`) |
+| `MERIDIAN_SHOW_API_URL` | If `true`, Streamlit shows the API base URL in a **Developer** expander (default hidden) |
 | `CORS_ORIGINS` | Comma-separated origins for Streamlit (default includes localhost:8501) |
 | `LOG_LEVEL` | Default `INFO` |
 
@@ -108,11 +113,12 @@ Step-by-step for **Cloud Run**, **Compose on a VM**, and checklists: **[deploy/D
 
 | Area | In this repo today |
 |------|---------------------|
-| **Agent** | `MeridianAgent` (Groq + MCP) in `meridian_support/agent.py`. |
+| **Layout** | `meridian_support/agent/` (`MeridianAgent`), `configs/settings.py`, `guardrails/`, `llm/tracing.py`, `models/schemas.py`, `services/` (sessions + catalog shortcut), `tools/mcp_client.py`, `catalog/intents.py`; HTTP in `meridian_support/api.py`. |
+| **Agent** | `MeridianAgent` (Groq + MCP) in `meridian_support/agent/meridian_agent.py`. |
 | **Guardrails** | Prompt-injection markers blocked; sensitive MCP tools require verified session; catalog facts from tools only (prices, stock units); FastAPI auth routes in `meridian_support/api.py`. |
 | **Tests** | `pytest` in `tests/` (`make check`); optional live run `python3 scripts/verify_tools_llm.py`. |
-| **Evals** | No automated eval / golden dataset in-repo yet. |
-| **Tracing** | **Optional LangSmith:** set `LANGSMITH_TRACING=true`, `LANGSMITH_API_KEY`, and optionally `LANGSMITH_PROJECT`; Groq `chat.completions` calls are wrapped when those are set (see `.env.example`). **`LANGCHAIN_TRACING_V2` / `LANGCHAIN_API_KEY`** are supported as aliases. **Logging:** set `LOG_LEVEL`, run uvicorn; successful `/chat` logs duration and `tool_used`. OTEL is not wired in-repo. |
+| **Evals** | No automated offline eval / golden-dataset harness yet. There is a **mocked shopper scenario** in `tests/test_agent_shopping_conversation.py` that drives every catalog and order tool (no live Groq/MCP required). |
+| **Tracing** | **LangSmith (optional, in-repo):** the `langsmith` SDK wraps the Groq `AsyncOpenAI` client when tracing is on and an API key is set—turns on with `LANGSMITH_TRACING=true`, `LANGSMITH_API_KEY`, optional `LANGSMITH_PROJECT` (see `.env.example`; `LANGCHAIN_TRACING_V2` / `LANGCHAIN_API_KEY` work as aliases). **Logging:** set `LOG_LEVEL`, run uvicorn; successful **`/chat`** and **`/chat/stream`** calls log duration and `tool_used`. **Not wired here:** Langfuse, OpenTelemetry exporters, or other trace backends. |
 
 ## CI
 

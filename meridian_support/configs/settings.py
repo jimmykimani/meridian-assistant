@@ -9,7 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # Load repo-root `.env` even when the process cwd is elsewhere.
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(_REPO_ROOT / ".env")
 
 
@@ -23,6 +23,7 @@ class Settings:
     groq_completion_retries: int
     groq_retry_base_sec: float
     max_tool_result_chars: int
+    max_assistant_chars_in_context: int
 
     @staticmethod
     def from_env() -> Settings:
@@ -42,6 +43,10 @@ class Settings:
             groq_retry_base_sec=float(os.environ.get("GROQ_RETRY_BASE_SEC", "1.5")),
             max_tool_result_chars=max(
                 512,
-                int(os.environ.get("MAX_TOOL_RESULT_CHARS", "5000")),
+                int(os.environ.get("MAX_TOOL_RESULT_CHARS", "10000")),
+            ),
+            max_assistant_chars_in_context=max(
+                2000,
+                int(os.environ.get("MAX_ASSISTANT_CHARS_IN_CONTEXT", "8000")),
             ),
         )

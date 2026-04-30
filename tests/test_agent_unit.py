@@ -5,7 +5,7 @@ from meridian_support.agent import (
     detect_prompt_injection,
     extract_customer_id_from_tool_result,
 )
-from meridian_support.session_manager import SessionManager
+from meridian_support.services.sessions import SessionManager
 
 
 def test_detect_prompt_injection() -> None:

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+import types
+from typing import Any
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -64,6 +68,66 @@ def test_chat_unknown_session_returns_410(api_client: TestClient) -> None:
     )
     assert r.status_code == 410
     assert "session" in r.json().get("detail", "").lower()
+
+
+def test_chat_stream_unknown_session_returns_410(api_client: TestClient) -> None:
+    with api_client.stream(
+        "POST",
+        "/chat/stream",
+        json={"session_id": "definitely-unknown-session-id", "message": "hello"},
+    ) as r:
+        assert r.status_code == 410
+
+
+def test_chat_full_catalog_bypass(api_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    from main import app
+
+    mcp = app.state.mcp
+
+    async def fake_call_tool(self: Any, name: str, arguments: dict[str, Any]) -> str:
+        assert name == "list_products"
+        assert arguments.get("is_active") is True
+        return "1. [X-1] Demo — $1 | 1 unit"
+
+    monkeypatch.setattr(mcp, "call_tool", types.MethodType(fake_call_tool, mcp))
+    sid = api_client.post("/sessions/new").json()["session_id"]
+    r = api_client.post("/chat", json={"session_id": sid, "message": "show ALL products !!!!"})
+    assert r.status_code == 200
+    data = r.json()
+    assert "Active products" in data["message"]
+    assert "[X-1]" in data["message"]
+    assert data.get("tool_used") == "list_products"
+
+
+def test_chat_stream_ndjson_mocked(api_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    from main import app
+
+    agent = app.state.agent
+
+    async def fake_chat_stream(self, session, user_message: str):
+        yield {"event": "delta", "text": "Hi "}
+        yield {"event": "delta", "text": "there"}
+        yield {
+            "event": "final",
+            "session_id": session.session_id,
+            "message": "Hi there",
+            "requires_auth": False,
+            "tool_used": None,
+            "confidence": 0.9,
+        }
+
+    monkeypatch.setattr(agent, "chat_stream", types.MethodType(fake_chat_stream, agent))
+    sid = api_client.post("/sessions/new").json()["session_id"]
+    with api_client.stream(
+        "POST",
+        "/chat/stream",
+        json={"session_id": sid, "message": "hello"},
+    ) as r:
+        assert r.status_code == 200
+        lines = [ln for ln in r.iter_lines() if ln]
+    events = [json.loads(ln) for ln in lines]
+    assert [e.get("event") for e in events] == ["delta", "delta", "final"]
+    assert events[-1]["message"] == "Hi there"
 
 
 def test_logout_clears_auth(api_client: TestClient) -> None:

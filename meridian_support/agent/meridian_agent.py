@@ -11,50 +11,20 @@ import asyncio
 import copy
 import json
 import logging
-import os
 import re
+from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 
 from openai import APIStatusError, AsyncOpenAI, RateLimitError
 
-from meridian_support.mcp_client import MCPClient
-from meridian_support.session_manager import SessionState
-from meridian_support.settings import Settings
+from meridian_support.configs.settings import Settings
+from meridian_support.guardrails.injection import detect_prompt_injection
+from meridian_support.llm.tracing import wrap_openai_client_for_tracing
+from meridian_support.services.sessions import SessionState
+from meridian_support.tools.mcp_client import MCPClient
 
 logger = logging.getLogger(__name__)
-
-
-def _langsmith_tracing_enabled() -> bool:
-    v = (
-        os.environ.get("LANGSMITH_TRACING")
-        or os.environ.get("LANGCHAIN_TRACING_V2")
-        or ""
-    ).strip().lower()
-    return v in ("1", "true", "yes")
-
-
-def _langsmith_api_key_present() -> bool:
-    return bool(
-        (os.environ.get("LANGSMITH_API_KEY") or os.environ.get("LANGCHAIN_API_KEY") or "").strip()
-    )
-
-
-def _wrap_openai_client_for_tracing(client: AsyncOpenAI) -> AsyncOpenAI:
-    """Send Groq chat.completions calls to LangSmith when tracing env is on."""
-    if not _langsmith_tracing_enabled():
-        return client
-    if not _langsmith_api_key_present():
-        logger.warning(
-            "LangSmith tracing is enabled but LANGSMITH_API_KEY (or LANGCHAIN_API_KEY) is missing"
-        )
-        return client
-    try:
-        from langsmith.wrappers import wrap_openai
-
-        return wrap_openai(client, chat_name="meridian-support-groq")
-    except ImportError:
-        logger.warning("langsmith package not installed; tracing disabled")
-        return client
 
 
 # Tools we expose to the LLM, in a stable order (subset of MCP server tools).
@@ -77,8 +47,9 @@ _COMPACT_OPENAI_TOOLS: dict[str, dict[str, Any]] = {
             "name": "list_products",
             "description": (
                 "List catalog products with prices and stock. Use for browse requests "
-                '("show products", "what do you sell", by category) without needing a SKU first. '
-                "Optional filters: category, is_active."
+                '("show products", by category) without needing a SKU first. '
+                "For huge catalogs, **always** pass a `category` filter or use `search_products` "
+                "so results stay focused—never pull the entire catalog in one call if it can be narrowed."
             ),
             "parameters": {
                 "type": "object",
@@ -225,7 +196,8 @@ SYSTEM_INSTRUCTION = """You are Meridian Support for Meridian Electronics (monit
   - Line 2: **Price:** from tool data (never omit when the tool includes it).
   - Line 3: **Stock:** numeric **units** from tools when present (e.g. `Stock: 53 units`); if count is 0, say **Out of stock** clearly.
 - After a list, add one short friendly line: either highlight **1–2 picks** (e.g. strong stock + good value) you can justify from the data, or invite them to ask for a category, compare models, or say a SKU for deep specs. Do not invent discounts or claims tools did not support.
-- Show **at least 8** products when the tool returns that many. Never mention internal limits or truncation.
+- When the shopper asks for **“everything”**, **“all products”**, or **20+ items at once**, do **not** paste a giant list: show **up to ~15** strong matches (or one **category** at a time), then invite them to name another category or “show more monitors” etc. Use **list_products** with a `category` filter or **search_products** so tool output stays manageable.
+- When the tool returns many rows, show **at least 8** and up to **15** in one reply unless the user asked for fewer. Never mention internal limits or truncation.
 
 **Placing an order:**
 - If the shopper wants to check out but is not verified yet, ask them—in chat—for **Meridian email** and **4-digit PIN** on separate lines (or clearly labeled). Say you will not repeat the PIN. Optionally remind them they can also use the sidebar **Account — orders & purchases** form.
@@ -252,24 +224,6 @@ UUID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
     re.IGNORECASE,
 )
-
-INJECTION_MARKERS = (
-    "ignore previous",
-    "ignore all previous",
-    "disregard previous",
-    "system prompt",
-    "you are now",
-    "developer message",
-    "override instructions",
-)
-
-
-def detect_prompt_injection(user_text: str) -> str | None:
-    low = user_text.lower()
-    for marker in INJECTION_MARKERS:
-        if marker in low:
-            return marker
-    return None
 
 
 def extract_customer_id_from_tool_result(result: Any) -> str | None:
@@ -367,7 +321,7 @@ class MeridianAgent:
             api_key=settings.groq_api_key,
             base_url="https://api.groq.com/openai/v1",
         )
-        self._client = _wrap_openai_client_for_tracing(raw_client)
+        self._client = wrap_openai_client_for_tracing(raw_client)
         self._model_id = settings.groq_model
         self._openai_tools: list[dict[str, Any]] | None = None
         self._tool_names: set[str] = set()
@@ -416,6 +370,110 @@ class MeridianAgent:
         assert last is not None
         raise last
 
+    async def _create_chat_completion_stream(self, **kwargs: Any) -> Any:
+        """Same retry policy as _chat_completion, but returns an async stream from Groq."""
+        kwargs = dict(kwargs)
+        kwargs["stream"] = True
+        attempts = self._settings.groq_completion_retries
+        base = self._settings.groq_retry_base_sec
+        last: BaseException | None = None
+        for attempt in range(attempts):
+            try:
+                return await self._client.chat.completions.create(**kwargs)
+            except RateLimitError as exc:
+                last = exc
+                if attempt >= attempts - 1:
+                    raise
+                wait = _retry_after_seconds(exc)
+                if wait is None:
+                    wait = min(60.0, base * (2**attempt))
+                logger.warning(
+                    "Groq rate limited (stream), retry %s/%s after %.1fs",
+                    attempt + 1,
+                    attempts,
+                    wait,
+                )
+                await asyncio.sleep(wait)
+            except APIStatusError as exc:
+                if getattr(exc, "status_code", None) != 429:
+                    raise
+                last = exc
+                if attempt >= attempts - 1:
+                    raise
+                wait = _retry_after_seconds(exc)
+                if wait is None:
+                    wait = min(60.0, base * (2**attempt))
+                logger.warning(
+                    "Groq HTTP 429 (stream), retry %s/%s after %.1fs",
+                    attempt + 1,
+                    attempts,
+                    wait,
+                )
+                await asyncio.sleep(wait)
+        assert last is not None
+        raise last
+
+    @staticmethod
+    def _synthetic_response_from_stream(
+        content_parts: list[str],
+        tool_calls_state: dict[int, dict[str, str]],
+    ) -> Any:
+        """Build an object shaped like a non-streaming chat completion for shared tool logic."""
+        tlist: list[Any] = []
+        for idx in sorted(tool_calls_state):
+            st = tool_calls_state[idx]
+            tid = (st.get("id") or "").strip() or f"stream_{idx}"
+            name = (st.get("name") or "").strip()
+            args = st.get("arguments") or "{}"
+            fn = SimpleNamespace(name=name, arguments=args)
+            tlist.append(SimpleNamespace(id=tid, function=fn))
+        text = "".join(content_parts) if content_parts else None
+        msg = SimpleNamespace(content=text, tool_calls=tlist)
+        choice = SimpleNamespace(message=msg, finish_reason="tool_calls" if tlist else "stop")
+        return SimpleNamespace(choices=[choice])
+
+    async def _iter_stream_deltas(
+        self, stream: Any
+    ) -> AsyncIterator[tuple[str, Any]]:
+        """
+        Consume one streamed completion. Yields ("delta", str) for assistant text,
+        then ("response", synthetic_completion) once.
+        """
+        content_parts: list[str] = []
+        tool_calls_state: dict[int, dict[str, str]] = {}
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            c0 = chunk.choices[0]
+            delta = getattr(c0, "delta", None)
+            if delta is None:
+                continue
+            piece = getattr(delta, "content", None) or ""
+            if piece:
+                content_parts.append(piece)
+                yield ("delta", piece)
+            tcs = getattr(delta, "tool_calls", None) or []
+            for tc in tcs:
+                idx = int(getattr(tc, "index", 0) or 0)
+                st = tool_calls_state.setdefault(
+                    idx, {"id": "", "name": "", "arguments": ""}
+                )
+                tid = getattr(tc, "id", None)
+                if isinstance(tid, str) and tid.strip():
+                    st["id"] = tid.strip()
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    nm = getattr(fn, "name", None)
+                    if isinstance(nm, str) and nm.strip():
+                        st["name"] = nm.strip()
+                    arg = getattr(fn, "arguments", None)
+                    if isinstance(arg, str) and arg:
+                        st["arguments"] = st.get("arguments", "") + arg
+        resp = MeridianAgent._synthetic_response_from_stream(
+            content_parts, tool_calls_state
+        )
+        yield ("response", resp)
+
     async def _ensure_tools(self) -> list[dict[str, Any]]:
         if self._openai_tools is not None:
             return self._openai_tools
@@ -431,7 +489,18 @@ class MeridianAgent:
         return self._openai_tools
 
     def _build_messages(self, session: SessionState, user_message: str) -> list[dict[str, Any]]:
-        prior = list(session.conversation)
+        cap = self._settings.max_assistant_chars_in_context
+        prior: list[dict[str, Any]] = []
+        for m in list(session.conversation):
+            m2 = dict(m)
+            if m2.get("role") == "assistant" and isinstance(m2.get("content"), str):
+                c = m2["content"]
+                if len(c) > cap:
+                    m2["content"] = (
+                        c[:cap]
+                        + "\n\n… *(Earlier reply shortened so we can keep chatting without errors.)*"
+                    )
+            prior.append(m2)
         max_items = max(6, self._settings.max_history_turns * 3)
         if len(prior) > max_items:
             prior = prior[-max_items:]
@@ -606,6 +675,162 @@ class MeridianAgent:
             auth_gate_fired=auth_gate_fired,
             tool_error=True,
         )
+
+    async def chat_stream(
+        self, session: SessionState, user_message: str
+    ) -> AsyncIterator[dict[str, Any]]:
+        """
+        Same behavior as chat(), but emits NDJSON-friendly dicts for streaming UIs.
+
+        Events:
+        - {"event": "delta", "text": "..."} — assistant text fragments (final turn only).
+        - {"event": "final", "session_id", "message", "requires_auth", "tool_used", "confidence"}
+        """
+        marker = detect_prompt_injection(user_message)
+        if marker:
+            out = {
+                "message": (
+                    "I can only help with Meridian product and order questions. "
+                    "Please rephrase your request without meta-instructions."
+                ),
+                "requires_auth": not bool(session.authenticated_customer_id),
+                "tool_used": None,
+                "confidence": 0.95,
+            }
+            yield {
+                "event": "final",
+                "session_id": session.session_id,
+                "message": out["message"],
+                "requires_auth": bool(out["requires_auth"]),
+                "tool_used": out["tool_used"],
+                "confidence": out["confidence"],
+            }
+            return
+
+        tools = await self._ensure_tools()
+        messages = self._build_messages(session, user_message)
+
+        last_tool: str | None = None
+        auth_gate_fired = False
+        tool_error = False
+
+        cap = self._settings.max_tool_result_chars
+        for _round in range(self._settings.max_tool_rounds):
+            _shrink_tool_contents_in_messages(messages, cap)
+            stream = await self._create_chat_completion_stream(
+                model=self._model_id,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=0.35,
+                max_tokens=1536,
+            )
+            response: Any | None = None
+            async for kind, payload in self._iter_stream_deltas(stream):
+                if kind == "delta":
+                    yield {"event": "delta", "text": payload}
+                elif kind == "response":
+                    response = payload
+            if response is None:
+                raise RuntimeError("stream produced no completion")
+
+            choice = response.choices[0]
+            msg = choice.message
+
+            tool_calls = getattr(msg, "tool_calls", None) or []
+            if not tool_calls:
+                final_text = (msg.content or "").strip() or (
+                    "I could not generate a response. Please try again in a moment."
+                )
+                assistant_entry: dict[str, Any] = {"role": "assistant", "content": final_text}
+                messages.append(assistant_entry)
+                session.conversation = messages[1:]
+                structured = self._structured(
+                    message=final_text,
+                    session=session,
+                    tool_used=last_tool,
+                    auth_gate_fired=auth_gate_fired,
+                    tool_error=tool_error,
+                )
+                yield {
+                    "event": "final",
+                    "session_id": session.session_id,
+                    "message": structured["message"],
+                    "requires_auth": structured["requires_auth"],
+                    "tool_used": structured["tool_used"],
+                    "confidence": structured["confidence"],
+                }
+                return
+
+            assistant_entry = {
+                "role": "assistant",
+                "content": msg.content or None,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments or "{}",
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            }
+            messages.append(assistant_entry)
+
+            for tc in tool_calls:
+                name = tc.function.name
+                raw_args = tc.function.arguments or "{}"
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+                except json.JSONDecodeError:
+                    args = {}
+                if not isinstance(args, dict):
+                    args = {}
+                last_tool = name
+                try:
+                    payload, gated = await self._execute_tool(session, name, args)
+                    if gated:
+                        auth_gate_fired = True
+                    if isinstance(payload, dict) and payload.get("error"):
+                        tool_error = True
+                    if name == VERIFY_TOOL:
+                        self._record_verify_outcome(session, payload, args)
+                except Exception as exc:
+                    tool_error = True
+                    payload = {"error": str(exc)}
+                    logger.exception("Tool %s failed", name)
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": _tool_message_content(payload, max_chars=cap),
+                    }
+                )
+
+        final_text = (
+            "I reached my internal limit for tool actions on that request. "
+            "Please narrow the question or contact Meridian support."
+        )
+        messages.append({"role": "assistant", "content": final_text})
+        session.conversation = messages[1:]
+        structured = self._structured(
+            message=final_text,
+            session=session,
+            tool_used=last_tool,
+            auth_gate_fired=auth_gate_fired,
+            tool_error=True,
+        )
+        yield {
+            "event": "final",
+            "session_id": session.session_id,
+            "message": structured["message"],
+            "requires_auth": structured["requires_auth"],
+            "tool_used": structured["tool_used"],
+            "confidence": structured["confidence"],
+        }
 
     @staticmethod
     def _structured(

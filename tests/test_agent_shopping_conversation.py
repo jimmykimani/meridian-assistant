@@ -13,8 +13,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from meridian_support.agent import MeridianAgent
-from meridian_support.session_manager import SessionManager
-from meridian_support.settings import Settings
+from meridian_support.configs.settings import Settings
+from meridian_support.services.sessions import SessionManager
 
 CUST_ID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 ORDER_ID = "b2c3d4e5-f6a7-8901-bcde-f12345678901"
@@ -31,6 +31,7 @@ def _test_settings() -> Settings:
         groq_completion_retries=2,
         groq_retry_base_sec=0.01,
         max_tool_result_chars=8000,
+        max_assistant_chars_in_context=8000,
     )
 
 
