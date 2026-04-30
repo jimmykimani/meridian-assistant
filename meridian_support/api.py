@@ -73,9 +73,10 @@ def _http_exception_from_groq(exc: APIStatusError) -> HTTPException:
         return HTTPException(
             status_code=502,
             detail=(
-                "That’s more than we can process in one go. Try asking for a **category** "
-                "(e.g. monitors, keyboards), **up to ~15 items**, or use **Clear chat history** "
-                "for a fresh start—then we can keep helping you shop."
+                "The AI hit a **request size limit** on this turn (often a long chat plus a big "
+                "catalog reply still in context)—not because you asked for “too many products.” "
+                "Use **Clear chat history** in the sidebar, then one short line such as "
+                "**Order COM-0017, quantity 1** or complete **Account** sign-in if checkout needs it."
             ),
         )
     if code == 400:
