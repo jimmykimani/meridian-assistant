@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -364,6 +365,7 @@ async def auth_logout(request: Request, body: ResetSessionRequest) -> SessionSta
 async def chat(request: Request, body: ChatRequest) -> ChatResponse:
     agent: MeridianAgent = request.app.state.agent
     session = _get_or_create_session(request, body.session_id)
+    t0 = time.perf_counter()
     try:
         out = await agent.chat(session, body.message.strip())
     except RuntimeError as exc:
@@ -392,6 +394,15 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             status_code=500,
             detail="An unexpected error occurred. Please try again.",
         ) from None
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    logger.info(
+        "chat ok session_id=%s ms=%.0f tool_used=%s requires_auth=%s",
+        session.session_id,
+        elapsed_ms,
+        out.get("tool_used"),
+        bool(out.get("requires_auth")),
+    )
 
     return ChatResponse(
         session_id=session.session_id,

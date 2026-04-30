@@ -102,6 +102,17 @@ Step-by-step for **Cloud Run**, **Compose on a VM**, and checklists: **[deploy/D
 
 - **Chat returns 429 in the UI** — Groq **rate limits**; the API **retries with backoff** automatically. Raise **`GROQ_COMPLETION_RETRIES`** / **`GROQ_RETRY_BASE_SEC`**, or send fewer messages per minute. See [console.groq.com](https://console.groq.com/).
 - **`/health` works but `/chat` fails** — check **`GROQ_API_KEY`**, model id (`GROQ_MODEL`), or MCP cold start; see uvicorn logs.
+- **Chat feels stuck on “Thinking…”** — first MCP catalog call after idle can take **30–90s** (Cloud Run cold start). Groq + several tool rounds add more time. Increase Streamlit **`MERIDIAN_CHAT_TIMEOUT`** (seconds) if needed; watch API logs for `chat ok … ms=`.
+
+## Agent, guardrails, observability
+
+| Area | In this repo today |
+|------|---------------------|
+| **Agent** | `MeridianAgent` (Groq + MCP) in `meridian_support/agent.py`. |
+| **Guardrails** | Prompt-injection markers blocked; sensitive MCP tools require verified session; system policy for prices vs stock wording and PII; FastAPI auth routes in `meridian_support/api.py`. |
+| **Tests** | `pytest` in `tests/` (`make check`); optional live run `python3 scripts/verify_tools_llm.py`. |
+| **Evals** | No automated eval / golden dataset in-repo yet. |
+| **Tracing** | **No** LangSmith, Langfuse, or OpenTelemetry SDK. Use Python **`logging`** to **stdout/stderr**: set `LOG_LEVEL`, run uvicorn, then read **terminal** logs locally or the host’s **log viewer** (e.g. Render **Logs**). Successful `/chat` calls log duration and `tool_used`. For real traces/spans, add OTEL (export to Honeycomb, Datadog, Grafana Tempo, etc.) or wrap the Groq client with your chosen LLM observability product. |
 
 ## Tests
 
