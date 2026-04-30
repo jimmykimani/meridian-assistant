@@ -22,10 +22,6 @@ from meridian_support.settings import Settings
 
 logger = logging.getLogger(__name__)
 
-# Groq returns HTTP 413 if the chat completion payload is too large. Full MCP
-# JSON Schemas + long tool outputs (e.g. list_products) exceed that limit.
-MAX_TOOL_MESSAGE_CHARS = 18_000
-
 # Tools we expose to the LLM, in a stable order (subset of MCP server tools).
 _MERIDIAN_TOOL_ORDER: tuple[str, ...] = (
     "list_products",
@@ -188,6 +184,7 @@ SYSTEM_INSTRUCTION = """You are Meridian Support for Meridian Electronics (monit
 
 Anonymous customers (no verification yet):
 - Help immediately with product discovery: search, compare, availability, and general questions. Use list_products, search_products, and get_product freely.
+- For vague requests like "show products", prefer **search_products** with a short keyword, or **list_products** with a **category** and/or **is_active=true**, so tool results stay concise.
 - Keep the experience fast and friendly—no login lecture unless they ask for something sensitive.
 
 Sensitive actions (require verification first):
@@ -256,7 +253,20 @@ def _compact_tools_for_llm(mcp_tool_names: set[str]) -> list[dict[str, Any]]:
     return out
 
 
-def _tool_message_content(payload: Any, *, max_chars: int = MAX_TOOL_MESSAGE_CHARS) -> str:
+def _shrink_tool_contents_in_messages(messages: list[dict[str, Any]], max_chars: int) -> None:
+    """Last-resort cap on tool role strings so a full request stays under Groq limits."""
+    tail = "\n…[truncated]"
+    for m in messages:
+        if m.get("role") != "tool":
+            continue
+        c = m.get("content")
+        if not isinstance(c, str) or len(c) <= max_chars:
+            continue
+        logger.warning("shrinking oversized tool message in flight (%d -> %d)", len(c), max_chars)
+        m["content"] = c[: max(200, max_chars - len(tail))] + tail
+
+
+def _tool_message_content(payload: Any, *, max_chars: int) -> str:
     """Serialize tool output for the next LLM turn; truncate to stay under Groq size limits."""
     if isinstance(payload, (dict, list)):
         raw = json.dumps({"result": payload}, ensure_ascii=False)
@@ -460,7 +470,9 @@ class MeridianAgent:
         auth_gate_fired = False
         tool_error = False
 
+        cap = self._settings.max_tool_result_chars
         for _round in range(self._settings.max_tool_rounds):
+            _shrink_tool_contents_in_messages(messages, cap)
             response = await self._chat_completion(
                 model=self._model_id,
                 messages=messages,
@@ -532,7 +544,7 @@ class MeridianAgent:
                     {
                         "role": "tool",
                         "tool_call_id": tc.id,
-                        "content": _tool_message_content(payload),
+                        "content": _tool_message_content(payload, max_chars=cap),
                     }
                 )
 

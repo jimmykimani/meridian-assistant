@@ -22,6 +22,7 @@ class Settings:
     max_history_turns: int
     groq_completion_retries: int
     groq_retry_base_sec: float
+    max_tool_result_chars: int
 
     @staticmethod
     def from_env() -> Settings:
@@ -39,4 +40,8 @@ class Settings:
             max_history_turns=int(os.environ.get("MAX_HISTORY_TURNS", "12")),
             groq_completion_retries=max(1, int(os.environ.get("GROQ_COMPLETION_RETRIES", "6"))),
             groq_retry_base_sec=float(os.environ.get("GROQ_RETRY_BASE_SEC", "1.5")),
+            max_tool_result_chars=max(
+                512,
+                int(os.environ.get("MAX_TOOL_RESULT_CHARS", "5000")),
+            ),
         )

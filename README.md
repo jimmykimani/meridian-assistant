@@ -68,6 +68,7 @@ Test logins (exact strings): [docs/test-customers.md](docs/test-customers.md).
 | `GROQ_MODEL` | Optional, default `llama-3.1-8b-instant` (use `llama-3.3-70b-versatile` for heavier reasoning) |
 | `GROQ_COMPLETION_RETRIES` | Optional, default `6` (each agent round retries on 429) |
 | `GROQ_RETRY_BASE_SEC` | Optional, default `1.5` (exponential backoff cap 60s) |
+| `MAX_TOOL_RESULT_CHARS` | Optional, default `5000` — max characters of each MCP tool result sent back to Groq (avoids HTTP 413) |
 | `MCP_SERVER_URL` | Optional override for MCP endpoint |
 | `MERIDIAN_API_URL` | Streamlit → API base (default `http://127.0.0.1:8000`) |
 | `MERIDIAN_CHAT_TIMEOUT` | Streamlit HTTP timeout seconds (default `180`) |
