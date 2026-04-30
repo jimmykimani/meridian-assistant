@@ -1,3 +1,9 @@
+<p align="center">
+  <a href="https://meridian-assistant-mpjriaxwaresd4fc2pjajt.streamlit.app/"><strong>Live app — open the Streamlit demo</strong></a>
+  <br /><br />
+  <a href="https://meridian-assistant-mpjriaxwaresd4fc2pjajt.streamlit.app/"><img src="docs/images/streamlit-app.png" alt="Meridian Support — Streamlit UI connected to the Render API" width="920" /></a>
+</p>
+
 # Meridian Support
 
 AI customer support prototype for Meridian Electronics: **Groq** (Llama, tool calling) + **Meridian order MCP** (Streamable HTTP). **FastAPI** exposes `/chat`; **Streamlit** is the demo UI.
