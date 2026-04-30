@@ -7,11 +7,14 @@ customers need orders, account details, or purchases.
 
 from __future__ import annotations
 
+import html
 import os
+import re
 from typing import Any
 
 import httpx
 import streamlit as st
+import streamlit.components.v1 as components
 
 DEFAULT_API = "http://127.0.0.1:8000"
 
@@ -33,6 +36,82 @@ def _env_or_secret(key: str, default: str) -> str:
 
 API_BASE = _env_or_secret("MERIDIAN_API_URL", DEFAULT_API).rstrip("/")
 CHAT_TIMEOUT = float(_env_or_secret("MERIDIAN_CHAT_TIMEOUT", "180"))
+
+# SKUs as shown by the assistant, e.g. [COM-0012] …
+_SKU_IN_BRACKETS = re.compile(r"\[([A-Z][A-Z0-9]{1,11}-\d+)\]")
+
+
+def _extract_skus_from_message(text: str) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _SKU_IN_BRACKETS.finditer(text):
+        sku = m.group(1)
+        if sku not in seen:
+            seen.add(sku)
+            out.append(sku)
+    return out
+
+
+def _assistant_copy_buttons(content: str, *, component_key: str) -> None:
+    """Per-assistant-message SKU chips + copy full reply (runs in an isolated iframe)."""
+    skus = _extract_skus_from_message(content)[:16]
+    safe_id = re.sub(r"[^a-zA-Z0-9]", "_", component_key)[:48] or "cid"
+    esc_full = html.escape(content)
+    sku_row = ""
+    if skus:
+        chips = "".join(
+            f'<button type="button" class="mer-sku" data-sku="{html.escape(sku, quote=True)}">'
+            f"{html.escape(sku)}</button>"
+            for sku in skus
+        )
+        sku_row = (
+            f'<div class="mer-row"><span class="mer-hint">Copy SKU</span>{chips}</div>'
+        )
+    html_block = f"""
+<div class="mer-tools">
+  <textarea id="mer_full_{safe_id}" readonly class="mer-ta">{esc_full}</textarea>
+  {sku_row}
+  <div class="mer-row">
+    <button type="button" class="mer-full" id="mer_btn_{safe_id}">Copy full reply</button>
+  </div>
+</div>
+<script>
+(function() {{
+  var ta = document.getElementById("mer_full_{safe_id}");
+  var bf = document.getElementById("mer_btn_{safe_id}");
+  document.querySelectorAll(".mer-sku").forEach(function(b) {{
+    b.addEventListener("click", function() {{
+      var sku = b.getAttribute("data-sku") || b.textContent;
+      navigator.clipboard.writeText(sku).then(function() {{
+        var o = b.textContent; b.textContent = "Copied"; setTimeout(function() {{ b.textContent = o; }}, 1200);
+      }}).catch(function() {{}});
+    }});
+  }});
+  if (bf && ta) {{
+    bf.addEventListener("click", function() {{
+      navigator.clipboard.writeText(ta.value).then(function() {{
+        bf.textContent = "Copied!";
+        setTimeout(function() {{ bf.textContent = "Copy full reply"; }}, 1600);
+      }}).catch(function() {{}});
+    }});
+  }}
+}})();
+</script>
+<style>
+.mer-tools {{ font-family: 'Plus Jakarta Sans', system-ui, sans-serif; margin-top: 0.25rem; }}
+.mer-ta {{ position: absolute; left: -9999px; width: 1px; height: 1px; opacity: 0; }}
+.mer-row {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; margin-top: 0.3rem; }}
+.mer-hint {{ font-size: 0.7rem; color: #94a3b8; margin-right: 0.1rem; }}
+.mer-sku, .mer-full {{
+  font-size: 0.72rem; padding: 0.28rem 0.6rem; border-radius: 8px;
+  border: 1px solid rgba(148,163,184,0.45); background: rgba(51,65,85,0.9);
+  color: #f8fafc; cursor: pointer;
+}}
+.mer-full {{ font-weight: 600; }}
+</style>
+"""
+    h = 100 if skus else 52
+    components.html(html_block, height=h, scrolling=False)
 
 
 def _inject_theme() -> None:
@@ -221,9 +300,14 @@ def _render_chat() -> None:
         "Sign in from the sidebar **only** when you need account or order actions."
     )
 
-    for msg in st.session_state.messages:
+    for idx, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+            if msg.get("role") == "assistant" and (msg.get("content") or "").strip():
+                _assistant_copy_buttons(
+                    str(msg["content"]),
+                    component_key=f"mer_copy_{idx}_{len(st.session_state.messages)}",
+                )
 
     last = st.session_state.messages[-1] if st.session_state.messages else None
     if (

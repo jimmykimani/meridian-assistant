@@ -11,6 +11,7 @@ import asyncio
 import copy
 import json
 import logging
+import os
 import re
 from typing import Any
 
@@ -21,6 +22,40 @@ from meridian_support.session_manager import SessionState
 from meridian_support.settings import Settings
 
 logger = logging.getLogger(__name__)
+
+
+def _langsmith_tracing_enabled() -> bool:
+    v = (
+        os.environ.get("LANGSMITH_TRACING")
+        or os.environ.get("LANGCHAIN_TRACING_V2")
+        or ""
+    ).strip().lower()
+    return v in ("1", "true", "yes")
+
+
+def _langsmith_api_key_present() -> bool:
+    return bool(
+        (os.environ.get("LANGSMITH_API_KEY") or os.environ.get("LANGCHAIN_API_KEY") or "").strip()
+    )
+
+
+def _wrap_openai_client_for_tracing(client: AsyncOpenAI) -> AsyncOpenAI:
+    """Send Groq chat.completions calls to LangSmith when tracing env is on."""
+    if not _langsmith_tracing_enabled():
+        return client
+    if not _langsmith_api_key_present():
+        logger.warning(
+            "LangSmith tracing is enabled but LANGSMITH_API_KEY (or LANGCHAIN_API_KEY) is missing"
+        )
+        return client
+    try:
+        from langsmith.wrappers import wrap_openai
+
+        return wrap_openai(client, chat_name="meridian-support-groq")
+    except ImportError:
+        logger.warning("langsmith package not installed; tracing disabled")
+        return client
+
 
 # Tools we expose to the LLM, in a stable order (subset of MCP server tools).
 _MERIDIAN_TOOL_ORDER: tuple[str, ...] = (
@@ -41,8 +76,9 @@ _COMPACT_OPENAI_TOOLS: dict[str, dict[str, Any]] = {
         "function": {
             "name": "list_products",
             "description": (
-                "List catalog products. Optional filters: category, is_active. "
-                "Returns a formatted catalog string."
+                "List catalog products with prices and stock. Use for browse requests "
+                '("show products", "what do you sell", by category) without needing a SKU first. '
+                "Optional filters: category, is_active."
             ),
             "parameters": {
                 "type": "object",
@@ -180,16 +216,16 @@ _COMPACT_OPENAI_TOOLS: dict[str, dict[str, Any]] = {
     },
 }
 
-SYSTEM_INSTRUCTION = """You are Meridian Support for Meridian Electronics (monitors, keyboards, printers, networking, accessories).
+SYSTEM_INSTRUCTION = """You are Meridian Support for Meridian Electronics (monitors, keyboards, printers, networking, accessories). Sound warm, helpful, and a bit like a knowledgeable store associate—not stiff or robotic.
 
-**Catalog replies (match a polished storefront UI):**
-- Use list_products, search_products, and get_product for facts.
-- When showing multiple products, use a **numbered list** (1., 2., 3., …). For **each** product use this layout (markdown-friendly):
-  - First line: **`[SKU]` Product name** (example: `[COM-0012] Gaming Desktop - Model B`)
-  - Next line: **Price:** amount with currency from tool data (never omit price when the tool includes it).
-  - Next line: **Availability:** one of **In stock**, **Low stock**, **Out of stock**, or **Temporarily unavailable** only—do **not** quote numeric warehouse counts (no "32 units").
-- After the list, add a short line such as "…and more—tell me a model or SKU if you want details."
-- For vague "show products" asks, prefer search_products with a keyword, or list_products with category / is_active=true. Paste at least **8** items when the tool provides that many. Never mention truncation or internal limits.
+**Catalog (always use tools for product facts):**
+- Call **list_products**, **search_products**, or **get_product** before answering anything about inventory, prices, or SKUs. For vague asks ("show products", "what's good", a category), use **list_products** with `is_active=true` and/or **search_products** with a sensible keyword—do not ask for a SKU first unless the catalog is empty or the tool errors.
+- When showing multiple products, use a **numbered list** (1., 2., 3., …). For each item (markdown-friendly):
+  - Line 1: **`[SKU]` Name** (keep SKU in brackets so it is easy to copy, e.g. `[COM-0012] Gaming Desktop - Model B`).
+  - Line 2: **Price:** from tool data (never omit when the tool includes it).
+  - Line 3: **Stock:** numeric **units** from tools when present (e.g. `Stock: 53 units`); if count is 0, say **Out of stock** clearly.
+- After a list, add one short friendly line: either highlight **1–2 picks** (e.g. strong stock + good value) you can justify from the data, or invite them to ask for a category, compare models, or say a SKU for deep specs. Do not invent discounts or claims tools did not support.
+- Show **at least 8** products when the tool returns that many. Never mention internal limits or truncation.
 
 **Placing an order:**
 - If the shopper wants to check out but is not verified yet, ask them—in chat—for **Meridian email** and **4-digit PIN** on separate lines (or clearly labeled). Say you will not repeat the PIN. Optionally remind them they can also use the sidebar **Account — orders & purchases** form.
@@ -205,8 +241,8 @@ Privacy:
 - Never mix another customer's data. Only show order/customer UUIDs that belong to the **current verified** session from tool output.
 
 Honesty:
-- Never invent SKUs, prices, or order IDs. Refunds are out of scope—direct to human support.
-- Keep tone concise and professional."""
+- Never invent SKUs, prices, stock counts, or order IDs. Refunds are out of scope—direct to human support.
+- Stay concise but conversational; one short paragraph of guidance after a long list is welcome."""
 
 PUBLIC_TOOLS = frozenset({"list_products", "get_product", "search_products"})
 SENSITIVE_TOOLS = frozenset({"get_customer", "list_orders", "get_order", "create_order"})
@@ -327,10 +363,11 @@ class MeridianAgent:
     def __init__(self, settings: Settings, mcp: MCPClient) -> None:
         self._settings = settings
         self._mcp = mcp
-        self._client = AsyncOpenAI(
+        raw_client = AsyncOpenAI(
             api_key=settings.groq_api_key,
             base_url="https://api.groq.com/openai/v1",
         )
+        self._client = _wrap_openai_client_for_tracing(raw_client)
         self._model_id = settings.groq_model
         self._openai_tools: list[dict[str, Any]] | None = None
         self._tool_names: set[str] = set()
@@ -486,8 +523,8 @@ class MeridianAgent:
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
-                temperature=0.25,
-                max_tokens=1024,
+                temperature=0.35,
+                max_tokens=1536,
             )
             choice = response.choices[0]
             msg = choice.message
