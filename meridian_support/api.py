@@ -21,6 +21,103 @@ from meridian_support.settings import Settings
 logger = logging.getLogger(__name__)
 
 
+def _upstream_error_message(exc: APIStatusError) -> str:
+    """Best-effort parse of Groq/OpenAI error body for logging and user hints."""
+    body = getattr(exc, "body", None)
+    inner: str | None = None
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            inner = (err.get("message") or "").strip() or None
+            if not inner and isinstance(err.get("code"), (str, int)):
+                inner = str(err.get("code")).strip() or None
+        elif isinstance(err, str):
+            inner = err.strip() or None
+    if not inner:
+        m = getattr(exc, "message", None)
+        if m:
+            inner = str(m).strip() or None
+    if inner and len(inner) > 600:
+        inner = inner[:600] + "…"
+    return inner or ""
+
+
+def _http_exception_from_groq(exc: APIStatusError) -> HTTPException:
+    """Turn OpenAI-compatible API errors into clear HTTPException.detail for /chat."""
+    code = exc.status_code or 0
+    upstream = _upstream_error_message(exc)
+    logger.warning("Groq API error status=%s upstream=%r body=%s", code, upstream, getattr(exc, "body", None))
+
+    if code == 429:
+        return HTTPException(
+            status_code=429,
+            detail=(
+                "Too many requests to the AI right now. Wait a bit and try again, "
+                "or check your Groq limits at https://console.groq.com/"
+            ),
+        )
+    if code == 413:
+        return HTTPException(
+            status_code=502,
+            detail=(
+                "That message or conversation is too large for the AI. "
+                "Try a shorter question, fewer products at once, or clear chat history."
+            ),
+        )
+    if code == 400:
+        hint = "Try rephrasing in plain English, or ask for a smaller slice of the catalog."
+        low = upstream.lower()
+        if "context" in low and ("length" in low or "window" in low or "token" in low):
+            return HTTPException(
+                status_code=502,
+                detail=(
+                    "That request is too long for the AI context window. "
+                    "Shorten your message or clear older chat and try again."
+                ),
+            )
+        if "tool" in low and ("invalid" in low or "parse" in low or "json" in low or "schema" in low):
+            return HTTPException(
+                status_code=502,
+                detail=(
+                    "The assistant hit a problem using a catalog tool. "
+                    "Please try again, or ask for a more specific product question."
+                ),
+            )
+        if upstream:
+            return HTTPException(
+                status_code=502,
+                detail=f"We couldn’t run the assistant on that input. {upstream} {hint}".strip(),
+            )
+        return HTTPException(
+            status_code=502,
+            detail=f"We couldn’t run the assistant on that input. {hint}",
+        )
+    if code in (401, 403):
+        return HTTPException(
+            status_code=502,
+            detail="The AI service rejected the API key or permissions. Check GROQ_API_KEY and your Groq project.",
+        )
+    if code == 404:
+        return HTTPException(
+            status_code=502,
+            detail="The configured AI model was not found. Check GROQ_MODEL is a valid Groq model id.",
+        )
+    if code >= 500:
+        return HTTPException(
+            status_code=502,
+            detail="The AI service had a temporary problem. Try again in a moment.",
+        )
+    if upstream:
+        return HTTPException(
+            status_code=502,
+            detail=f"The AI returned an error ({code}): {upstream}",
+        )
+    return HTTPException(
+        status_code=502,
+        detail=f"The AI returned an error ({code}). Please try again.",
+    )
+
+
 def _cors_origins() -> list[str]:
     raw = os.environ.get(
         "CORS_ORIGINS",
@@ -262,24 +359,7 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
             detail="Groq rejected the request (check GROQ_API_KEY).",
         ) from exc
     except APIStatusError as exc:
-        logger.warning("Groq API error: %s", exc)
-        if exc.status_code == 429:
-            raise HTTPException(
-                status_code=429,
-                detail="Groq rate limit. Wait and retry or check https://console.groq.com/",
-            ) from exc
-        if exc.status_code == 413:
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "LLM request too large (HTTP 413). Try a narrower question; "
-                    "if this persists after redeploy, contact support."
-                ),
-            ) from exc
-        raise HTTPException(
-            status_code=502,
-            detail=f"LLM API error (HTTP {exc.status_code}).",
-        ) from exc
+        raise _http_exception_from_groq(exc) from exc
     except Exception:
         logger.exception("chat failed")
         raise HTTPException(
