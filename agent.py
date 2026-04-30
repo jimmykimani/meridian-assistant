@@ -8,6 +8,7 @@ for behavior — only auth routing constants).
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import re
@@ -16,11 +17,172 @@ from typing import Any
 from openai import APIStatusError, AsyncOpenAI, RateLimitError
 
 from mcp_client import MCPClient
-from schema_utils import simplify_schema_for_gemini
 from session_manager import SessionState
 from settings import Settings
 
 logger = logging.getLogger(__name__)
+
+# Groq returns HTTP 413 if the chat completion payload is too large. Full MCP
+# JSON Schemas + long tool outputs (e.g. list_products) exceed that limit.
+MAX_TOOL_MESSAGE_CHARS = 18_000
+
+# Tools we expose to the LLM, in a stable order (subset of MCP server tools).
+_MERIDIAN_TOOL_ORDER: tuple[str, ...] = (
+    "list_products",
+    "search_products",
+    "get_product",
+    "verify_customer_pin",
+    "get_customer",
+    "list_orders",
+    "get_order",
+    "create_order",
+)
+
+# Minimal OpenAI-style function declarations (tiny schemas vs. full MCP).
+_COMPACT_OPENAI_TOOLS: dict[str, dict[str, Any]] = {
+    "list_products": {
+        "type": "function",
+        "function": {
+            "name": "list_products",
+            "description": (
+                "List catalog products. Optional filters: category, is_active. "
+                "Returns a formatted catalog string."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "description": "Filter by category"},
+                    "is_active": {
+                        "type": "boolean",
+                        "description": "If true, only active products",
+                    },
+                },
+            },
+        },
+    },
+    "search_products": {
+        "type": "function",
+        "function": {
+            "name": "search_products",
+            "description": "Keyword search over the product catalog.",
+            "parameters": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                },
+            },
+        },
+    },
+    "get_product": {
+        "type": "function",
+        "function": {
+            "name": "get_product",
+            "description": "Get one product by SKU including stock.",
+            "parameters": {
+                "type": "object",
+                "required": ["sku"],
+                "properties": {
+                    "sku": {"type": "string", "description": "Product SKU, e.g. COM-0001"},
+                },
+            },
+        },
+    },
+    "verify_customer_pin": {
+        "type": "function",
+        "function": {
+            "name": "verify_customer_pin",
+            "description": (
+                "Verify Meridian customer with email + 4-digit PIN. "
+                "Call only after the user provides both; never echo the PIN."
+            ),
+            "parameters": {
+                "type": "object",
+                "required": ["email", "pin"],
+                "properties": {
+                    "email": {"type": "string"},
+                    "pin": {"type": "string", "description": "4-digit PIN"},
+                },
+            },
+        },
+    },
+    "get_customer": {
+        "type": "function",
+        "function": {
+            "name": "get_customer",
+            "description": "Customer profile by UUID (authenticated customers only).",
+            "parameters": {
+                "type": "object",
+                "required": ["customer_id"],
+                "properties": {
+                    "customer_id": {"type": "string", "description": "Customer UUID"},
+                },
+            },
+        },
+    },
+    "list_orders": {
+        "type": "function",
+        "function": {
+            "name": "list_orders",
+            "description": "List orders; optional filters by customer_id and status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "customer_id": {"type": "string"},
+                    "status": {
+                        "type": "string",
+                        "description": "draft|submitted|approved|fulfilled|cancelled",
+                    },
+                },
+            },
+        },
+    },
+    "get_order": {
+        "type": "function",
+        "function": {
+            "name": "get_order",
+            "description": "Order detail by order UUID.",
+            "parameters": {
+                "type": "object",
+                "required": ["order_id"],
+                "properties": {
+                    "order_id": {"type": "string", "description": "Order UUID"},
+                },
+            },
+        },
+    },
+    "create_order": {
+        "type": "function",
+        "function": {
+            "name": "create_order",
+            "description": "Create a new order for the verified customer.",
+            "parameters": {
+                "type": "object",
+                "required": ["customer_id", "items"],
+                "properties": {
+                    "customer_id": {"type": "string"},
+                    "items": {
+                        "type": "array",
+                        "description": "Line items with sku, quantity, unit_price, currency",
+                        "items": {
+                            "type": "object",
+                            "required": ["sku", "quantity", "unit_price", "currency"],
+                            "properties": {
+                                "sku": {"type": "string"},
+                                "quantity": {"type": "integer"},
+                                "unit_price": {
+                                    "type": "string",
+                                    "description": "Decimal as string",
+                                },
+                                "currency": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
 
 SYSTEM_INSTRUCTION = """You are Meridian Support for Meridian Electronics (monitors, keyboards, printers, networking, accessories).
 
@@ -82,26 +244,35 @@ def extract_customer_id_from_tool_result(result: Any) -> str | None:
     return None
 
 
-def _mcp_tools_to_openai_tools(mcp_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _compact_tools_for_llm(mcp_tool_names: set[str]) -> list[dict[str, Any]]:
+    """Small tool list + schemas for Groq (avoids HTTP 413 from oversized MCP schemas)."""
     out: list[dict[str, Any]] = []
-    for t in mcp_tools:
-        if not isinstance(t, dict) or "name" not in t:
+    for name in _MERIDIAN_TOOL_ORDER:
+        if name not in mcp_tool_names:
             continue
-        name = str(t["name"])
-        desc = (t.get("description") or "")[:8000]
-        raw_schema = t.get("inputSchema") or {"type": "object", "properties": {}}
-        schema = simplify_schema_for_gemini(raw_schema)
-        out.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": desc,
-                    "parameters": schema,
-                },
-            }
-        )
+        spec = _COMPACT_OPENAI_TOOLS.get(name)
+        if spec:
+            out.append(copy.deepcopy(spec))
     return out
+
+
+def _tool_message_content(payload: Any, *, max_chars: int = MAX_TOOL_MESSAGE_CHARS) -> str:
+    """Serialize tool output for the next LLM turn; truncate to stay under Groq size limits."""
+    if isinstance(payload, (dict, list)):
+        raw = json.dumps({"result": payload}, ensure_ascii=False)
+        if len(raw) <= max_chars:
+            return raw
+        text_repr = json.dumps(payload, ensure_ascii=False)
+    else:
+        text_repr = str(payload)
+        raw = json.dumps({"result": text_repr}, ensure_ascii=False)
+        if len(raw) <= max_chars:
+            return raw
+    note = "\n…[truncated: narrow category or ask for fewer products.]"
+    cap = max(500, max_chars - len(note) - 40)
+    logger.warning("truncating tool result for model (>%d chars)", max_chars)
+    truncated = text_repr[:cap] + note
+    return json.dumps({"result": truncated}, ensure_ascii=False)
 
 
 def _retry_after_seconds(exc: BaseException) -> float | None:
@@ -194,8 +365,14 @@ class MeridianAgent:
         if self._openai_tools is not None:
             return self._openai_tools
         mcp_tools = await self._mcp.list_tools()
-        self._tool_names = {str(t["name"]) for t in mcp_tools if isinstance(t, dict) and "name" in t}
-        self._openai_tools = _mcp_tools_to_openai_tools(mcp_tools)
+        mcp_names = {str(t["name"]) for t in mcp_tools if isinstance(t, dict) and "name" in t}
+        self._tool_names = set(mcp_names)
+        self._openai_tools = _compact_tools_for_llm(mcp_names)
+        if not self._openai_tools:
+            logger.warning(
+                "MCP tools/list had no overlap with Meridian allowlist; server tools=%s",
+                sorted(mcp_names),
+            )
         return self._openai_tools
 
     def _build_messages(self, session: SessionState, user_message: str) -> list[dict[str, Any]]:
@@ -351,16 +528,11 @@ class MeridianAgent:
                     payload = {"error": str(exc)}
                     logger.exception("Tool %s failed", name)
 
-                if isinstance(payload, (dict, list)):
-                    fr_body: dict[str, Any] = {"result": payload}
-                else:
-                    fr_body = {"result": str(payload)}
-
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tc.id,
-                        "content": json.dumps(fr_body),
+                        "content": _tool_message_content(payload),
                     }
                 )
 

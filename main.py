@@ -268,6 +268,14 @@ async def chat(request: Request, body: ChatRequest) -> ChatResponse:
                 status_code=429,
                 detail="Groq rate limit. Wait and retry or check https://console.groq.com/",
             ) from exc
+        if exc.status_code == 413:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "LLM request too large (HTTP 413). Try a narrower question; "
+                    "if this persists after redeploy, contact support."
+                ),
+            ) from exc
         raise HTTPException(
             status_code=502,
             detail=f"LLM API error (HTTP {exc.status_code}).",
